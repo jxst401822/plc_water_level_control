@@ -138,6 +138,10 @@ water-control valve 80             # Manual valve opening 0-100% (manual mode on
 water-control read-raw 0           # Dump raw registers (byte-order / address debug)
 water-control set-ip 192.168.0.122 # Set PLC IP
 
+# Step test (identify process gain K / dead time τ, recommend PID gains)
+python3 step_test.py               # valve step +10%, logs CSV, prints SIMC gains
+python3 step_test.py --step -10    # step down instead (level rises)
+
 # Calibration (piecewise, multi-point)
 water-control set-scale                 # Show current calibration points
 water-control set-scale add 14000 120   # Add point (iLevelRaw, measured mm)
@@ -248,7 +252,11 @@ qwModbusTCP_Server_Device_12 := %MW22; qwModbusTCP_Server_Device_13 := %MW23;  (
 qwModbusTCP_Server_Device_14 := %MW24; qwModbusTCP_Server_Device_15 := %MW25;  (* rKd fb *)
 ```
 `rKp/rKi/rKd` are declared `AT %MW20/22/24 : REAL` with ST default init values
-(used when bPidTune=0). See `pid_tuning.st` and `pid_fixed.st` in the project.
+(used when bPidTune=0). The current full PLC program source, including
+anti-overshoot improvements (internal SP ramp, PV filter, derivative-on-
+measurement, output rate limit, sensor-fault debounce), is in
+`st/PLC_PRG_improved.st`; see `docs/ST侧改进说明.md` for the change list and
+verification checklist.
 
 ## PID Implementation Notes
 
@@ -276,6 +284,14 @@ The system is non-linear across the full operating range, use these pre-tuned pa
 These are exactly the gains `set_water_level.py` applies automatically.
 (The earlier Kp=3.0 + `Ki = 0.535 - 0.0009×mm` formula caused overshoot and
 valve cycling — it is deprecated; do not restore it.)
+
+> ⚠️ **Gain provenance caveat:** this file previously carried BOTH a
+> "Kp=3/Ki=0.49" anchor set and the "production-proven Kp=1.8/Ki=0.3" set
+> above, with no measurement records for either. Treat all documented gains
+> as provisional until verified with `step_test.py` (valve step → measures
+> process gain K, dead time τ, natural inflow d0 → prints SIMC-recommended
+> Kp/Ki). After a verified test, backfill: `st/PLC_PRG_improved.st` defaults,
+> `set_water_level.py` SEGMENTS, and this file. See `docs/ST侧改进说明.md`.
 
 #### One-click auto-switch script (silent mode for demos):
 An included script automatically matches the optimal PID parameters in background when setting a target level, NO PID tuning details exposed to end user, only returns final result. It also **ramps** the setpoint (≤5 mm steps, target lead clamped to ±10 mm over measured level) instead of writing a single step, and only reports success after the level settles within ±3 mm:
@@ -349,3 +365,7 @@ Before use, ensure in Machine Expert:
 - `scripts/set_water_level.py` — set target mm: applies segment-optimized PID silently,
   ramps the setpoint (anti-overshoot), monitors until settled
   (imports `water_control_cli` from the same dir directly — no subprocess)
+- `scripts/step_test.py` — valve step-response test: measures process gain K,
+  dead time τ, natural inflow d0; prints SIMC/IMC recommended Kp/Ki; logs CSV.
+  Self-guarded (aborts + restores on level guards [45,150]mm, sensor fault,
+  Ctrl+C — manual mode bypasses PLC HH/LL interlocks)
