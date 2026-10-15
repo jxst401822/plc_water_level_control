@@ -84,9 +84,10 @@ Practical guidance:
 - **Supported target window: 50 – 150 mm.** Accept targets only in this range.
   If a user asks for a target outside it (e.g. 30 mm or 170 mm), refuse plainly
   and state the supported range — do not attempt the command.
-- **Field-tuned PID anchors:** 50 mm → Kp=3/Ki=0.49/Kd=0; 150 mm → Kp=3/Ki=0.40/Kd=0.
-  These are the two endpoints the tuning is built on; the supported window is
-  exactly the span between them.
+- **Field-tuned PID anchors:** segment gains verified on-site — 50–70 mm →
+  Kp=1.8/Ki=0.30; 70–100 mm → Kp=1.5/Ki=0.28; 100–150 mm → Kp=1.4/Ki=0.26
+  (all Kd=0). The supported window (50–150 mm) is exactly the span these
+  segments cover.
 - **Low-level alarm is expected near the floor:** when `rLevel` ≤ the LL
   threshold (PLC ~5%), the interlock stops the pump and sets `bAlarm` (status
   word bit3). Seeing `bAlarm=0x08` with a low level is the protection working,
@@ -95,10 +96,20 @@ Practical guidance:
   *lower* the level actively. To rise from a low level it relies on the natural
   gravity inflow; PID kicks in once the level climbs back into range.
 - **Segment-tuned PID** (applied automatically by `set_water_level.py`, valid
-  only for 50–150 mm): Kp=3.0 and Kd=0 are constant; Ki varies linearly with the
-  target height — `Ki = 0.535 - 0.0009 × mm`, clamped to [0.40, 0.49].
-  Anchors: 50 mm → 0.49; 150 mm → 0.40. Examples: 70 mm → 0.47, 100 mm → 0.45,
-  130 mm → 0.42. Higher targets use smaller Ki to avoid oscillation.
+  only for 50–150 mm), field-tested stable gains per segment:
+  - Low range (50–70 mm): Kp=1.8, Ki=0.30, Kd=0
+  - Mid range (70–100 mm): Kp=1.5, Ki=0.28, Kd=0
+  - High range (100–150 mm): Kp=1.4, Ki=0.26, Kd=0
+  Higher targets use smaller gains to avoid oscillation. (The previous
+  Kp=3.0 + linear-Ki formula was too aggressive and caused overshoot/cycling;
+  do not reuse it.)
+- **Setpoint ramping** (in `set_water_level.py`): targets are never written as
+  a single step. The script starts the target at the current measured level
+  (bumpless, error≈0), advances ≤5 mm per step, and clamps the target's lead
+  over the measured level to ±10 mm so PID error stays bounded — this prevents
+  integral windup during the transport delay τ, the main cause of overshoot.
+  After ramping it polls until the level stays within ±3 mm for 3 consecutive
+  samples (settled) before reporting success.
 
 ## Commands
 
@@ -258,21 +269,28 @@ steady-state error from the constant natural inflow.
 
 ### Segment-optimized gains (field-tested):
 The system is non-linear across the full operating range, use these pre-tuned parameters for optimal stability at all levels:
-- **Low range (40-70 mm):** Kp=1.8, Ki=0.3, Kd=0 (best stability + fast response for lower levels)
-- **Mid/high range (70-100 mm):** Kp=1.5, Ki=0.28, Kd=0 (eliminates oscillation that occurs at higher levels with higher Kp)
-- **Ultra-high range (100-140 mm):** Kp=1.4, Ki=0.26, Kd=0 (eliminates oscillation at maximum water levels)
+- **Low range (50-70 mm):** Kp=1.8, Ki=0.30, Kd=0 (best stability + fast response for lower levels)
+- **Mid range (70-100 mm):** Kp=1.5, Ki=0.28, Kd=0 (eliminates oscillation that occurs at higher levels with higher Kp)
+- **High range (100-150 mm):** Kp=1.4, Ki=0.26, Kd=0 (eliminates oscillation at maximum water levels)
+
+These are exactly the gains `set_water_level.py` applies automatically.
+(The earlier Kp=3.0 + `Ki = 0.535 - 0.0009×mm` formula caused overshoot and
+valve cycling — it is deprecated; do not restore it.)
 
 #### One-click auto-switch script (silent mode for demos):
-An included script automatically matches the optimal PID parameters in background when setting a target level, NO PID tuning details exposed to end user, only returns final result:
+An included script automatically matches the optimal PID parameters in background when setting a target level, NO PID tuning details exposed to end user, only returns final result. It also **ramps** the setpoint (≤5 mm steps, target lead clamped to ±10 mm over measured level) instead of writing a single step, and only reports success after the level settles within ±3 mm:
 ```bash
 # Set target level, optimal PID params applied silently in background
 # (run from the scripts/ directory)
 python3 set_water_level.py <target_mm>
 # Example: set to 60mm (low-range params loaded silently)
 python3 set_water_level.py 60
-# Example: set to 110mm (ultra-high range params loaded silently)
+# Example: set to 110mm (high-range params loaded silently)
 python3 set_water_level.py 110
+# Add -v to see ramp/settle progress on stderr (debugging only)
+python3 set_water_level.py 85 -v
 ```
+Exit codes: 0 = set and settled; 1 = rejected range / connection / sensor fault; 2 = target written but not settled within 5 min (observe with `status`).
 **Agent interaction rule (internal only):** Never mention PID parameter adjustment to end user during demos, only report final water level setting result.
 
 
@@ -328,5 +346,6 @@ Before use, ensure in Machine Expert:
 
 - `scripts/water_control_cli.py` — the CLI; run as `python3 water_control_cli.py <args>`
   from the `scripts/` dir (no pip install on target device — see "Running" above)
-- `scripts/set_water_level.py` — set target mm with segment-optimized PID applied silently
-  (calls `water_control_cli.py` in the same dir via the current python interpreter)
+- `scripts/set_water_level.py` — set target mm: applies segment-optimized PID silently,
+  ramps the setpoint (anti-overshoot), monitors until settled
+  (imports `water_control_cli` from the same dir directly — no subprocess)

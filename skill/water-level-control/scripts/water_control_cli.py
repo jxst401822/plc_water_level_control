@@ -565,8 +565,6 @@ def cmd_set_scale(args, config):
 
     else:
         print(f"Error: unknown subcommand '{sub}'"); sys.exit(1)
-    mid = zero + 0.5 * (full - zero)
-    print(f"  check: 50% = {mid:.1f} mm")
 
 
 def main():
