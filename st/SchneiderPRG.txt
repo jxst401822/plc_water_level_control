@@ -1,0 +1,8 @@
+PROGRAM Hidden_PRG
+VAR
+   bStartRunFlag:BOOL:=FALSE;
+END_VAR
+MC_IN_MotionCalculate();
+
+
+
