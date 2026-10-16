@@ -9,6 +9,8 @@ venv/
 # 用户锁文件与预编译缓存:随开关 IDE 变化,可再生
 *.~u
 *.precompilecache
+*.compileinfo
+*.project.saved
 # 用户/机器相关的 IDE 选项文件(每台机器一份,勿入库;工程本体是 .project)
 *.opt
 
