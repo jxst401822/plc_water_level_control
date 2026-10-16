@@ -84,10 +84,11 @@ Practical guidance:
 - **Supported target window: 50 – 150 mm.** Accept targets only in this range.
   If a user asks for a target outside it (e.g. 30 mm or 170 mm), refuse plainly
   and state the supported range — do not attempt the command.
-- **Field-tuned PID anchors:** segment gains verified on-site — 50–70 mm →
-  Kp=1.8/Ki=0.30; 70–100 mm → Kp=1.5/Ki=0.28; 100–150 mm → Kp=1.4/Ki=0.26
-  (all Kd=0). The supported window (50–150 mm) is exactly the span these
-  segments cover.
+- **PID gains:** Kp=2.0, Ki=0.10, Kd=0 — provisional defaults, identical in
+  the ST program and `set_water_level.py`. Authoritative values come from
+  `step_test.py` (measures process gain K, dead time τ → SIMC recommendation);
+  after a verified run, backfill `st/PLC_PRG_improved.st` defaults,
+  `set_water_level.py` SEGMENTS, and this file.
 - **Low-level alarm is expected near the floor:** when `rLevel` ≤ the LL
   threshold (PLC ~5%), the interlock stops the pump and sets `bAlarm` (status
   word bit3). Seeing `bAlarm=0x08` with a low level is the protection working,
@@ -95,14 +96,9 @@ Practical guidance:
 - **Rising is passive:** the valve is on the draw side, so the system can only
   *lower* the level actively. To rise from a low level it relies on the natural
   gravity inflow; PID kicks in once the level climbs back into range.
-- **Segment-tuned PID** (applied automatically by `set_water_level.py`, valid
-  only for 50–150 mm), field-tested stable gains per segment:
-  - Low range (50–70 mm): Kp=1.8, Ki=0.30, Kd=0
-  - Mid range (70–100 mm): Kp=1.5, Ki=0.28, Kd=0
-  - High range (100–150 mm): Kp=1.4, Ki=0.26, Kd=0
-  Higher targets use smaller gains to avoid oscillation. (The previous
-  Kp=3.0 + linear-Ki formula was too aggressive and caused overshoot/cycling;
-  do not reuse it.)
+- **PID applied by `set_water_level.py`** (50–150 mm): reads the `SEGMENTS`
+  table — currently one flat entry (Kp=2.0, Ki=0.10, Kd=0); the table supports
+  per-segment gains once measured by `step_test.py`.
 - **Setpoint ramping** (in `set_water_level.py`): targets are never written as
   a single step. The script starts the target at the current measured level
   (bumpless, error≈0), advances ≤5 mm per step, and clamps the target's lead
@@ -260,48 +256,44 @@ verification checklist.
 
 ## PID Implementation Notes
 
-The PID block (see `pid_fixed.st`) is position-form:
-`out = Kp*err + Ki*∫err + Kd*derr/dt`, err = PV - SP. Key fixes vs the original:
-- integral `rInt` limit widened to ±1000 (was ±100, which capped I at 10% valve)
-- anti-windup: compute candidate output, back off this cycle's integral if the
-  output saturates and error is same-signed
-- use the same updated `rInt` for both anti-windup test and final output
+The PID (source: `st/PLC_PRG_improved.st`) is position-form, err = PV − SP
+(valve on the draw side → positive gains): `out = Kp·err + I + Kd·d(−PV)/dt`.
+Key implementation facts:
 
-Recommended starting gains: Kp=3.0, Ki=0.5, Kd=0.0. Tune Ki up to kill the
-steady-state error from the constant natural inflow.
+- **Integral state `rITerm` is stored as output contribution in % valve**,
+  clamped to `[rILimLo, rILimHi]` = [−20, +60]% — independent of Ki, so gains
+  can be retuned live (set-pid) without changing integral authority. rILimHi
+  must stay ≥ the valve opening needed to balance natural inflow (~20–40%).
+- **Anti-windup**: integration freezes when the candidate output saturates
+  (0/100%) with same-signed error; the saturation test and the final output
+  use the same updated rITerm.
+- **Derivative acts on the filtered measurement**, not the error → no kick on
+  SP steps. Kd=0 by default.
+- **Internal SP ramp** (2%/s) and **valve rate limit** (10%/s) apply on the
+  PID path; interlocks (HH/LL/sensor fault) and manual mode act immediately.
+- **PV low-pass filter** Tc=1s for PID use; interlocks use the unfiltered value.
 
-### Practical Tuning Workflow (verified on-site)
-1. If you see **steady-state error** (level stays permanently above/below target with no oscillation): increase `Ki` by 0.05-0.1 increments (max 0.6)
-2. If you see **frequent valve cycling / large jumps in valve command**: reduce `Kp` by 0.2-0.3 increments (minimum 1.5, below this response becomes too slow)
-3. Production-proven stable parameter set: Kp=1.8, Ki=0.3, Kd=0 (no frequent cycling, steady state error <±2mm)
+Current gains: **Kp=2.0, Ki=0.10, Kd=0** (provisional). Verify with
+`step_test.py` and backfill measured values (ST defaults, SEGMENTS, this file).
 
-### Segment-optimized gains (field-tested):
-The system is non-linear across the full operating range, use these pre-tuned parameters for optimal stability at all levels:
-- **Low range (50-70 mm):** Kp=1.8, Ki=0.30, Kd=0 (best stability + fast response for lower levels)
-- **Mid range (70-100 mm):** Kp=1.5, Ki=0.28, Kd=0 (eliminates oscillation that occurs at higher levels with higher Kp)
-- **High range (100-150 mm):** Kp=1.4, Ki=0.26, Kd=0 (eliminates oscillation at maximum water levels)
+### Tuning symptoms → action
+1. **Slow ±5–10 mm cycling, pump starts/stops late around the target**:
+   integral action too strong — halve Ki (0.10 → 0.05 → …). The output-%
+   integral clamp means lowering Ki does not reduce steady-state authority.
+2. **Persistent steady-state error, no oscillation**: integral authority
+   insufficient — raise Ki in +0.05 steps, or check via `status` whether the
+   equilibrium valve opening approaches rILimHi.
+3. **Frequent valve cycling / large jumps in valve command**: reduce Kp by
+   0.2–0.3 increments (keep ≥ ~1.5, below that the response gets too slow).
 
-These are exactly the gains `set_water_level.py` applies automatically.
-(The earlier Kp=3.0 + `Ki = 0.535 - 0.0009×mm` formula caused overshoot and
-valve cycling — it is deprecated; do not restore it.)
-
-> ⚠️ **Gain provenance caveat:** this file previously carried BOTH a
-> "Kp=3/Ki=0.49" anchor set and the "production-proven Kp=1.8/Ki=0.3" set
-> above, with no measurement records for either. Treat all documented gains
-> as provisional until verified with `step_test.py` (valve step → measures
-> process gain K, dead time τ, natural inflow d0 → prints SIMC-recommended
-> Kp/Ki). After a verified test, backfill: `st/PLC_PRG_improved.st` defaults,
-> `set_water_level.py` SEGMENTS, and this file. See `docs/ST侧改进说明.md`.
-
-#### One-click auto-switch script (silent mode for demos):
-An included script automatically matches the optimal PID parameters in background when setting a target level, NO PID tuning details exposed to end user, only returns final result. It also **ramps** the setpoint (≤5 mm steps, target lead clamped to ±10 mm over measured level) instead of writing a single step, and only reports success after the level settles within ±3 mm:
+#### One-click script (silent mode for demos):
+An included script applies the current PID gains silently when setting a target level, NO PID tuning details exposed to end user, only returns final result. It also **ramps** the setpoint (≤5 mm steps, target lead clamped to ±10 mm over measured level) instead of writing a single step, and only reports success after the level settles within ±3 mm:
 ```bash
-# Set target level, optimal PID params applied silently in background
+# Set target level, PID params applied silently in background
 # (run from the scripts/ directory)
 python3 set_water_level.py <target_mm>
-# Example: set to 60mm (low-range params loaded silently)
+# Examples:
 python3 set_water_level.py 60
-# Example: set to 110mm (high-range params loaded silently)
 python3 set_water_level.py 110
 # Add -v to see ramp/settle progress on stderr (debugging only)
 python3 set_water_level.py 85 -v

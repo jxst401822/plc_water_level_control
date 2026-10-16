@@ -33,7 +33,7 @@
 │   ├── SKILL.md                 # Skill 说明:命令、Modbus 寄存器映射、整定经验
 │   └── scripts/
 │       ├── water_control_cli.py # 主 CLI:读写水位/PID/标定/手动模式
-│       ├── set_water_level.py   # 一键设定目标水位(mm),分段 PID + 斜坡逼近 + 稳定监视
+│       ├── set_water_level.py   # 一键设定目标水位(mm),PID 匹配 + 斜坡逼近 + 稳定监视
 │       └── step_test.py         # 阀阶跃试验:实测 K/τ/d0,输出 SIMC 推荐 PID 增益
 └── output/                      # 运行输出目录(不入库)
 ```
@@ -71,7 +71,7 @@ python3 water_control_cli.py set-mm 85       # 设定目标水位 85 mm
 python3 water_control_cli.py read-mm         # 读取实测水位(mm)
 python3 water_control_cli.py set-pid 3 0.5 0 # 在线写入 Kp/Ki/Kd(自动使能 bPidTune)
 python3 water_control_cli.py auto|manual     # 自动/手动模式切换
-python3 set_water_level.py 60                # 一键设定 60mm,静默匹配分段 PID 参数
+python3 set_water_level.py 60                # 一键设定 60mm,静默匹配 PID 参数(当前为临时统一增益)
 ```
 
 常用命令一览(完整说明见 [SKILL.md](skill/water-level-control/SKILL.md)):
@@ -93,7 +93,7 @@ python3 set_water_level.py 60                # 一键设定 60mm,静默匹配分
 - **传感器量程**:约 16.4–158 mm 对应 0–100%(4mA 点 ≈ 16.4mm,非标定错误)。
 - **支持的控制目标窗口**:50–150 mm,区间外拒绝设定(PID 仅在此窗口现场整定)。
 - **泵物理下限**:约 33 mm,低于此无法再抽降。
-- **分段 PID**:`set_water_level.py` 按目标高度自动匹配(50–70mm: Kp=1.8/Ki=0.30;70–100mm: Kp=1.5/Ki=0.28;100–150mm: Kp=1.4/Ki=0.26;Kd=0)。注意:文档中的增益均待实测裁定,用 `step_test.py` 做阀阶跃试验可测得对象增益 K/纯滞后 τ 并输出 SIMC 推荐值(见 [docs/ST侧改进说明.md](docs/ST侧改进说明.md))。
+- **PID 增益(临时值,待实测定稿)**:当前统一 Kp=2.0/Ki=0.10/Kd=0(P 主导 + 小积分)。文档历史上两套"现场验证"增益(3.0/0.45 与 1.8/0.30 分段表)均已被现场证伪——2026-10-16 在 1.8/0.30 下观察到 ±10mm 积分振荡(升到 110 才开始抽、抽到 95 才停)。权威增益以 `step_test.py` 实测 K/τ → SIMC 推荐为准,见 [docs/ST侧改进说明.md](docs/ST侧改进说明.md)。
 - **设定值斜坡**:目标水位以 ≤5mm/步 逐步逼近、超前量限幅 ±10mm,避免阶跃设定在纯滞后内造成积分饱和与超调;写入后监视至 ±3mm 稳定带内才报成功。
 - **联锁**:HH=95% 全开抽水;LL=5% 停泵防干抽;传感器原始值 <3800 或 >20200 判断线故障。
 

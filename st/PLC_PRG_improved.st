@@ -10,7 +10,10 @@
         对 set-mm/write 直写路径同样生效 (CLI 斜坡之外的第二道防线)
    [G3] PV 一阶低通滤波 (Tc=1s): 抑制 4-20mA 采样噪声进 PID/微分
    [G4] 微分改为对测量微分 (derivative-on-measurement): SP 阶跃无微分踢
-   [G5] 抗饱和一致性修复: 饱和判别与最终输出使用同一个更新后的 rInt
+   [G5] 抗饱和一致性修复: 饱和判别与最终输出使用同一个更新后的积分
+   [G9] 积分状态改存"I 项输出贡献量(%阀开度)", 限幅与 Ki 解耦:
+        旧 rInt 钳位 ±100 → I 项范围 = Ki×100, 改 Ki 即改限幅, 整定不安全
+        (2026-10-16 现场: Ki=0.30 时 ±10mm 积分振荡; Ki 调小又怕顶不住入流)
         (原代码 rOut 用旧积分判饱和, 输出用新积分, 二者不一致)
    [G6] 传感器故障去抖: 连续 1s 超限才判故障, 单次干扰脉冲不再误停泵
    [G7] 阀输出速率限制 (10%/s, 仅 PID 路径): 防液压冲击/阀频繁大幅动作;
@@ -45,15 +48,27 @@ VAR
     iRawMax : INT := 20000;
 
     (* ===== PID 内部 ===== *)
-    rError, rPrevError, rInt, rDeriv, rPD, rOut : REAL;
+    (* [G9] 积分状态改存"I 项输出贡献量(%阀开度)", 不再是原始 ∫e·dt:
+       旧写法 rInt 钳位 ±100, I 项范围 = Ki×100, 与 Ki 耦合 ——
+       Ki=0.3 时 I 项可摆 ±30% (过大 → 积分振荡, 2026-10-16 现场 ±10mm 循环实锤);
+       Ki=0.05 时 I 项最大仅 5% (过小 → 顶不住入流平衡点, 静差消不掉)。
+       改存贡献量后限幅单位就是 %阀开度, 与 Ki 无关, 在线改 Ki 安全。 *)
+    rError, rITerm, rDeriv, rPD, rOut : REAL;
 
     (* ===== PID 参数 ===== *)
-    (* [G1] 默认值 = 现场验证的低段稳定参数 (原 3.0/0.5 导致超调与阀频繁动作);
-       bPidTune=1 时仍由 Modbus 写入的分段增益覆盖 *)
-    rKp AT %MW20 : REAL := 1.8;      (* 占 MW20-21, 默认值(上电/未使能时用) *)
-    rKi AT %MW22 : REAL := 0.30;     (* 占 MW22-23, 1/s, 抵消自然入流静差 *)
+    (* [G1] 临时保守值, 待 step_test.py 实测 K/τ 后回填:
+       2026-10-16 现场观察 Ki=0.30 仍 ±10mm 积分振荡, 故 Ki 降至 0.10;
+       bPidTune=1 时由 Modbus 写入值覆盖 *)
+    rKp AT %MW20 : REAL := 2.0;      (* 占 MW20-21, 默认值(上电/未使能时用) *)
+    rKi AT %MW22 : REAL := 0.10;     (* 占 MW22-23, 1/s, 抵消自然入流静差 *)
     rKd AT %MW24 : REAL := 0.0;      (* 占 MW24-25 *)
     bPidTune : BOOL := FALSE;        (* 1=采用 Modbus 传入的 Kp/Ki/Kd, 0=用上面默认 *)
+
+    (* [G9] I 项输出贡献限幅 (%阀开度, 与 Ki 无关):
+       上限须 ≥ 平衡入流所需阀开度 (预估 20-40%, 留裕量到 60);
+       下限允许小负值, 用于水位偏低时快速关阀 *)
+    rILimHi : REAL := 60.0;
+    rILimLo : REAL := -20.0;
 
     (* ===== 联锁阈值 (%, 工程量) ===== *)
     rLvlHH      : REAL := 95.0;   (* 高高: 最大抽水降压 *)
@@ -147,17 +162,17 @@ IF bSensorFault THEN
     (* 传感器故障: 停泵关阀+报警 (自然入流会缓慢上升, 需人工干预) *)
     bPumpCmd  := FALSE;
     GVL.rValveCmd := 0.0;
-    rInt      := 0.0;
+    rITerm    := 0.0;
 ELSIF (GVL.rLevel >= rLvlHH) THEN
     (* 高高液位: 最大抽水快速降压 *)
     bPumpCmd  := TRUE;
     GVL.rValveCmd := 100.0;
-    rInt      := 0.0;
+    rITerm    := 0.0;
 ELSIF (GVL.rLevel <= rLvlLL) THEN
     (* 低低液位: 停抽防干抽, 靠自然入流回涨 *)
     bPumpCmd  := FALSE;
     GVL.rValveCmd := 0.0;
-    rInt      := 0.0;
+    rITerm    := 0.0;
 ELSE
     (* ---------- 3. PID (阀在抽水侧: 偏高->开阀抽水) ---------- *)
     (* [G2] 误差用斜坡后的 SP; [G3] PV 用滤波值 *)
@@ -166,14 +181,15 @@ ELSE
     rDeriv := -(rPvFilt - rPrevLevel) / rDt;
     rPD    := rKp * rError + rKd * rDeriv;
 
-    (* [G5] 抗积分饱和: 先用当前积分算候选输出判饱和, 更新积分后
-       用同一个新 rInt 重算输出 —— 判别与输出严格一致 *)
-    rOut := rPD + rKi * rInt;
+    (* [G5][G9] 抗积分饱和: 先算候选输出判饱和, 未饱和才累积积分贡献量,
+       然后用同一个更新后的 rITerm 重算输出 —— 判别与输出严格一致。
+       rITerm 单位为 %阀开度, 限幅 [rILimLo, rILimHi] 与 Ki 无关 *)
+    rOut := rPD + rITerm;
     IF NOT ((rOut >= 100.0 AND rError > 0.0) OR (rOut <= 0.0 AND rError < 0.0)) THEN
-        rInt := rInt + rError * rDt;
-        rInt := LIMIT(-100.0, rInt, 100.0);
+        rITerm := rITerm + rKi * rError * rDt;
+        rITerm := LIMIT(rILimLo, rITerm, rILimHi);
     END_IF
-    rOut := rPD + rKi * rInt;                      (* 用更新后的 rInt *)
+    rOut := rPD + rITerm;                          (* 用更新后的 rITerm *)
     GVL.rValveCmd := LIMIT(0.0, rOut, 100.0);
 
     (* [G7] 阀输出速率限制 (仅 PID 路径, 联锁/手动不限速):
@@ -195,16 +211,15 @@ ELSE
     END_IF
 END_IF
 
-(* ---------- 5. 手动模式 (含无扰切换: 积分跟踪手动阀开度) ---------- *)
+(* ---------- 5. 手动模式 (含无扰切换: 积分贡献量直接跟踪手动阀开度) ---------- *)
 IF NOT bAuto THEN
     GVL.rValveCmd := LIMIT(0.0, GVL.rManualValve, 100.0);
     bPumpCmd  := bManualPump;
-    IF rKi <> 0.0 THEN
-        rInt := (GVL.rValveCmd - rKp * (rPvFilt - rSpRamp)) / rKi;
-        rInt := LIMIT(-100.0, rInt, 100.0);
-    END_IF
-    rPrevError := rPvFilt - rSpRamp;
-    (* 手动期间同步限速基准与斜坡起点, 切回自动无扰 *)
+    (* [G9] rITerm 即输出贡献量, 无扰切换 = 手动阀开度 − 当前 P(D) 项,
+       不再除以 Ki (旧写法在 Ki=0 时失效, 且量纲随 Ki 漂移) *)
+    rITerm := GVL.rValveCmd - (rKp * (rPvFilt - rSpRamp) + rKd * rDeriv);
+    rITerm := LIMIT(rILimLo, rITerm, rILimHi);
+    (* 手动期间同步限速基准与微分基准, 切回自动无扰 *)
     rPrevValve := GVL.rValveCmd;
     rPrevLevel := rPvFilt;
 END_IF
