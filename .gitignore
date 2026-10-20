@@ -11,6 +11,9 @@ venv/
 *.precompilecache
 *.compileinfo
 *.project.saved
+# 下载/编译时生成的控制器 bootinfo(带 Application GUID,每次构建可再生)
+*.bootinfo
+*.bootinfo_guids
 # 用户/机器相关的 IDE 选项文件(每台机器一份,勿入库;工程本体是 .project)
 *.opt
 

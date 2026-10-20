@@ -123,10 +123,12 @@ water-control write 65.0           # Set target level 0-100%
 # PID tuning (live, via Modbus)
 water-control set-pid 3 0.5 0      # Set Kp Ki Kd, auto-enables bPidTune, reads back
 water-control get-pid              # Read gains the PLC is actually using
+water-control get-learn            # Read PLC self-learned d0 (natural rise rate) and u_eq (equilibrium valve opening), plus derived K = d0/u_eq
 # Segment-optimized PID is applied automatically by set_water_level.py (see below).
 
 # Status / mode / debug
 water-control status               # All PLC status (percent + mm + PID)
+water-control trend --duration 600 --interval 2   # log level/valve to CSV, prints min/max/band stats (drift & oscillation diagnosis; Ctrl+C ends early, stats still printed)
 water-control auto                 # Auto mode (control word bit0 = 1)
 water-control manual               # Manual mode (control word bit0 = 0)
 water-control pump on|off          # Manual pump (control word bit1) — manual mode only
@@ -137,7 +139,18 @@ water-control set-ip 192.168.0.122 # Set PLC IP
 # Step test (identify process gain K / dead time τ, recommend PID gains)
 python3 step_test.py               # valve step +10%, logs CSV, prints SIMC gains
 python3 step_test.py --step -10    # step down instead (level rises)
+python3 step_test.py --no-trim     # skip baseline trimming (not recommended)
+```
 
+`step_test.py` picks the baseline valve opening `u0` from the PLC's learned `u_eq`
+(same registers `get-learn` reads; falls back to the current valve command), then
+**trims** it with a 20 s probe until the level is nearly stationary before
+recording. A drifting baseline measures the wrong K — the plant gain is strongly
+level-dependent near the pump floor. The post-step window is auto-shortened from
+the remaining margin to the 45/150 mm guards, and an aborted run still prints an
+analysis with validity warnings.
+
+```bash
 # Calibration (piecewise, multi-point)
 water-control set-scale                 # Show current calibration points
 water-control set-scale add 14000 120   # Add point (iLevelRaw, measured mm)
@@ -359,5 +372,7 @@ Before use, ensure in Machine Expert:
   (imports `water_control_cli` from the same dir directly — no subprocess)
 - `scripts/step_test.py` — valve step-response test: measures process gain K,
   dead time τ, natural inflow d0; prints SIMC/IMC recommended Kp/Ki; logs CSV.
+  Baseline `u0` comes from the PLC's learned `u_eq` and is trimmed until the level
+  is nearly stationary — a drifting baseline measures the wrong K.
   Self-guarded (aborts + restores on level guards [45,150]mm, sensor fault,
   Ctrl+C — manual mode bypasses PLC HH/LL interlocks)

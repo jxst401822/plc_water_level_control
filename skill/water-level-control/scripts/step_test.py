@@ -10,22 +10,31 @@
   Kp = 1/(K·(λ+τ)),  Ti = 4·(λ+τ),  Ki = Kp/Ti,  Kd = 0
   λ 为期望闭环时间常数, 输出 λ=τ (标准) 与 λ=2τ (更鲁棒) 两档。
 
-试验流程 (自动执行, 全程约 4-6 分钟):
+试验流程 (自动执行, 全程约 3-5 分钟):
   1. 检查液位在安全窗口 (55-140mm), 保存当前模式/阀开度
-  2. 切手动模式, 开泵, 阀置 u0 (默认=当前阀指令)
-  3. 基线记录 60s: 积分对象在固定阀开度下以恒定速率漂移, 拟合基线斜率 s0
-  4. 阀阶跃 +Δu (默认 +10%, 多抽水方向), 继续记录 180s
-  5. 恢复现场 (阀回 u0, 按原模式还原 auto/manual 与泵位)
-  6. 切线法求 τ, 斜率差求 K, 输出推荐增益 + CSV 数据文件
+  2. 切手动模式, 开泵, 阀置 u0
+     u0 默认取 PLC 自学习的平衡开度 u_eq (get-learn 同源), 退化为当前阀指令
+  3. **调零**: 短探针测基线斜率, 若液位还在漂(没停在平衡点)就微调 u0 直到接近静止
+  4. 基线记录 60s: 固定阀开度下拟合基线斜率 s0
+  5. 阀阶跃 +Δu (默认 +10%, 多抽水方向), 继续记录 (时长按液位离守卫的余量自动截断)
+  6. 恢复现场 (阀回 u0, 按原模式还原 auto/manual 与泵位)
+  7. 切线法求 τ, 斜率差求 K, 输出推荐增益 + CSV 数据文件
+     中止/中断时也会用已采到的数据尽力输出分析
+
+为什么必须调零 (2026-10-19 现场教训): u0 直接取自动模式的瞬时阀指令(33.5%),
+比真实平衡开度(≈23%)高了 10%, 整个基线液位以 -0.46mm/s 一路排到泵物理下限,
+阶跃后的斜率被"低液位区排水加速"污染, 算出的 K=0.18 比工作带真实 K≈0.02~0.03
+大 8 倍 —— 用这样的 K 定增益会把闭环整定得过激。
 
 ⚠️ 安全: 手动模式下 PLC 的 HH/LL 联锁被手动阀开度覆盖 (ST 第 5 段),
 本工具自带液位守卫: 试验中液位越出 [45, 150]mm 或传感器故障立即中止并恢复。
 Ctrl+C 同样会执行恢复。
 
 用法:
-    python3 step_test.py                    # 默认: u0=当前阀, +10% 阶跃
+    python3 step_test.py                    # 默认: u0=PLC 学到的 u_eq, +10% 阶跃
     python3 step_test.py --step -10         # 关小阀方向 (液位会上升)
     python3 step_test.py --u0 40 --step 15 --baseline 90 --record 240
+    python3 step_test.py --no-trim          # 跳过调零 (不推荐)
     python3 step_test.py --no-restore-auto  # 结束后保持手动 (默认还原原模式)
 
 仅依赖标准库 + pymodbus (经 water_control_cli), 目标设备无 pip 也可直接运行。
@@ -49,6 +58,13 @@ PUMP_FLOOR_MM = 33.0                       # 泵物理下限, 仅供提示
 # ---- 采样 ----
 DEFAULT_INTERVAL_S = 1.0
 
+# ---- 基线调零 (u0 微调) ----
+K_PRIOR = 0.025        # 工作带对象增益先验 %/s per %阀 (仅用于换算调零步长, 非实测 K)
+TRIM_TOL = 0.06        # 基线斜率容差 %/s (约 0.1mm/s); 超过则继续调零
+TRIM_MAX_ITERS = 3
+TRIM_MAX_DU = 15.0     # 单次调零最大阀开度修正 %
+DEFAULT_PROBE_S = 20.0 # 单次探针时长 s
+
 
 class AbortTest(Exception):
     pass
@@ -66,6 +82,19 @@ def read_valve(client, config):
 
 def set_manual_valve(client, config, pct):
     wc.write_real(client, wc.REG_MANUAL_VALVE, pct, config["slave_id"])
+
+
+def read_learned(client, config):
+    """读 PLC [G12] 自学习值 (d0 %/s, u_eq %); 读不到返回 (None, None)。"""
+    sid = config["slave_id"]
+    try:
+        d0 = wc.read_input_real(client, wc.IREG_INFLOW, sid)
+        ueq = wc.read_input_real(client, wc.IREG_UEQ, sid)
+    except Exception:
+        return None, None
+    if not (-5.0 < d0 < 5.0 and -0.01 < ueq < 100.1):
+        return None, None          # 寄存器未映射/全 0/垃圾值
+    return d0, ueq
 
 
 def linfit(xs, ys):
@@ -130,7 +159,7 @@ def record_phase(client, config, duration, interval, phase, samples,
         time.sleep(min(0.2, max(0.0, next_poll - (time.time() - t0))))
 
 
-def analyze(samples, t_step, u0, u1):
+def analyze(samples, t_step, u0, u1, learned_d0=None):
     """切线法: 基线斜率 s0, 阶跃后斜率 s1, 交点求 τ, 斜率差求 K。"""
     base = [s for s in samples if s["phase"] == "baseline"]
     post = [s for s in samples if s["phase"] == "poststep"]
@@ -170,7 +199,25 @@ def analyze(samples, t_step, u0, u1):
         kp = 1.0 / (K * (lam + tau))
         ti = 4.0 * (lam + tau)
         recs.append((name, kp, kp / ti, ti))
-    return {"s0": s0, "s1": s1, "K": K, "tau": tau, "d0": d0, "recs": recs}
+
+    warn = []
+    exc_base = max(s["mm"] for s in base) - min(s["mm"] for s in base)
+    exc_post = max(s["mm"] for s in post) - min(s["mm"] for s in post)
+    if exc_base > 15.0:
+        warn.append(
+            f"基线液位漂移 {exc_base:.1f}mm: u0 偏离平衡开度, 整个基线在排水, "
+            f"K 会被液位相关非线性带偏 (别拿本次结果定全域增益)")
+    if exc_post > 25.0:
+        warn.append(
+            f"阶跃后液位漂移 {exc_post:.1f}mm: 记录窗口内液位跨越过大, "
+            f"斜率取自非线性区, 建议缩短 --record 或减小 --step 重测")
+    if learned_d0 and learned_d0 > 0.02 and d0 > 2.0 * learned_d0:
+        warn.append(
+            f"外推 d0={d0:+.3f} %/s 远大于 PLC 自学习的 {learned_d0:+.3f} %/s: "
+            f"同一阀开度区间内近似成立, 但外推到阀全关已失真 -> "
+            f"本次 K 只能用于 u0={u0:.0f}% 附近的液位区间")
+    return {"s0": s0, "s1": s1, "K": K, "tau": tau, "d0": d0,
+            "recs": recs, "warn": warn}
 
 
 def print_report(r, u0, u1):
@@ -188,6 +235,8 @@ def print_report(r, u0, u1):
     print(f"\n现场应用 (先用 λ=2τ 鲁棒档验证, 响应过慢再换 λ=τ 档):")
     kp2, ki2 = r["recs"][1][1], r["recs"][1][2]
     print(f"  python3 water_control_cli.py set-pid {kp2:.2f} {ki2:.4f} 0")
+    for w in r.get("warn", []):
+        print(f"  ⚠️ {w}", file=sys.stderr)
     print("观察无振荡后, 可将实测值回填: st/PLC_PRG_improved.st 默认增益、"
           "set_water_level.py 分段表、SKILL.md 文档。")
     # 与两套文档值的对照
@@ -205,18 +254,34 @@ def write_csv(samples, path):
                         "valve": f"{s['valve']:.2f}"})
 
 
+def try_analyze(samples, t_step, u0, u1, learned_d0=None):
+    """中止/中断时也用已采到的数据尽力分析 (样本可能不完整)。"""
+    if t_step is None or u0 is None or u1 is None:
+        print("  中止发生在阶跃之前, 无 K/τ 可算", file=sys.stderr)
+        return
+    print("\n--- 用已采到的数据尽力分析 (样本不完整, 结论仅供参考) ---")
+    try:
+        print_report(analyze(samples, t_step, u0, u1, learned_d0), u0, u1)
+    except Exception as ae:
+        print(f"  数据不足以分析: {ae}", file=sys.stderr)
+
+
 def main():
     ap = argparse.ArgumentParser(
         prog="step_test",
         description="阀阶跃试验: 实测 K/τ/d0 并输出 SIMC 推荐 PID 增益")
     ap.add_argument("--u0", type=float, default=None,
-                    help="基线阀开度 %% (默认=当前阀指令, 钳制到 10-60)")
+                    help="基线阀开度 %% (默认=PLC 自学习的 u_eq, 读不到则用当前阀指令)")
     ap.add_argument("--step", type=float, default=10.0,
                     help="阶跃幅度 %% (默认 +10=开大阀多抽水; 可为负=关小阀)")
     ap.add_argument("--baseline", type=float, default=60.0,
                     help="基线记录时长 s (默认 60)")
-    ap.add_argument("--record", type=float, default=180.0,
-                    help="阶跃后记录时长 s (默认 180, 应 ≥ 5τ 预估)")
+    ap.add_argument("--record", type=float, default=120.0,
+                    help="阶跃后记录时长 s (默认 120, 会按离液位守卫的余量自动截短)")
+    ap.add_argument("--probe", type=float, default=DEFAULT_PROBE_S,
+                    help="调零探针时长 s (默认 %g)" % DEFAULT_PROBE_S)
+    ap.add_argument("--no-trim", dest="trim", action="store_false",
+                    help="跳过 u0 调零 (不推荐: 基线在漂时测出的 K 不可信)")
     ap.add_argument("--interval", type=float, default=DEFAULT_INTERVAL_S,
                     help="采样间隔 s (默认 1.0)")
     ap.add_argument("--out", type=str, default=None,
@@ -235,8 +300,11 @@ def main():
     samples = []
     # 预初始化, 保证早期 Ctrl+C 时恢复逻辑不引用未绑定变量
     u0 = None
+    u1 = None
+    t_step = None
     was_auto = True
     was_manual_pump = False
+    learned_d0 = None
 
     def restore():
         """尽力恢复现场: 阀回 u0, 按原模式还原。u0 未知则跳过。"""
@@ -258,7 +326,9 @@ def main():
         if sw & wc.ST_SENSOR_FAULT:
             print("Error: 传感器故障中, 拒绝试验"); sys.exit(1)
         was_auto = bool(sw & wc.ST_AUTO)
-        was_manual_pump = bool(sw & wc.ST_MANUAL_PUMP)
+        # 手动泵指令位在控制字 (保持寄存器 Device_10 bit1), 不在状态字里
+        cw = wc.read_control_word(client, sid)
+        was_manual_pump = bool(cw & wc.CTL_MANUAL_PUMP)
         target_pct = wc.read_real(client, wc.REG_TARGET_LEVEL, sid)
 
         pct0, mm0 = read_level(client, config)
@@ -268,14 +338,27 @@ def main():
                   f"请先调到窗口中部 (约 90-100mm) 再试验")
             sys.exit(1)
 
-        if args.u0 is None:
-            u0 = min(60.0, max(10.0, read_valve(client, config)))
-        else:
+        learned_d0, learned_ueq = read_learned(client, config)
+        if learned_d0 is not None:
+            print(f"PLC 自学习值: d0={learned_d0:+.3f} %/s  u_eq={learned_ueq:.1f}%")
+
+        if args.u0 is not None:
             u0 = min(90.0, max(0.0, args.u0))
-        u1 = u0 + args.step
-        if not (0.0 <= u1 <= 100.0):
-            print(f"Error: 阶跃后阀开度 {u1:.1f}% 越界 (u0={u0:.1f}, "
-                  f"step={args.step:+.1f})"); sys.exit(1)
+            u0_src = "命令行指定"
+        elif learned_ueq is not None and 5.0 <= learned_ueq <= 60.0:
+            u0 = learned_ueq
+            u0_src = "PLC 自学习 u_eq"
+        else:
+            u0 = min(60.0, max(10.0, read_valve(client, config)))
+            u0_src = "当前阀指令(自学习值不可用)"
+        print(f"基线阀开度 u0 = {u0:.1f}%  <- {u0_src}")
+
+        u1 = min(100.0, max(0.0, u0 + args.step))
+        if abs(u1 - u0) < 3.0:
+            print(f"Error: u0={u0:.1f}% 时加 step={args.step:+.1f}% 会顶到阀开度边界, "
+                  f"实际阶跃量只有 {u1 - u0:+.1f}% (<3%); 请改 --u0 或反号 --step")
+            sys.exit(1)
+        du_step = u1 - u0
 
         # 预估方向提示
         if args.step > 0:
@@ -287,7 +370,18 @@ def main():
             if mm0 > 120.0:
                 print("警告: 液位偏高且将上升, 注意 150mm 守卫")
 
-        print(f"记录: 基线 {args.baseline:.0f}s + 阶跃后 {args.record:.0f}s, "
+        # 阶跃后记录时长: 按"离守卫的液位余量 / 预估速率"自动截短, 防排到泵下限
+        if args.step > 0:
+            margin_pct = pct0 - wc.mm_to_pct(GUARD_LOW_MM, config)
+        else:
+            margin_pct = wc.mm_to_pct(GUARD_HIGH_MM, config) - pct0
+        est_rate = max(0.02, K_PRIOR * abs(u1 - u0))
+        record_len = min(args.record, max(30.0, 0.8 * margin_pct / est_rate))
+        if record_len < args.record - 1.0:
+            print(f"记录时长自动截短 {args.record:.0f}s -> {record_len:.0f}s "
+                  f"(离守卫余量约 {margin_pct:.0f}%, 预估速率 {est_rate:.2f}%/s)")
+
+        print(f"记录: 基线 {args.baseline:.0f}s + 阶跃后 {record_len:.0f}s, "
               f"采样 {args.interval:g}s; Ctrl+C 可中止 (自动恢复现场)")
 
         t0 = time.time()
@@ -295,22 +389,41 @@ def main():
         wc.set_control_bit(client, wc.CTL_MANUAL_PUMP, True, sid)
         wc.set_control_bit(client, wc.CTL_AUTO, False, sid)
         set_manual_valve(client, config, u0)
-        print("已切手动模式, 泵 ON, 阀 -> u0")
+        print(f"已切手动模式, 泵 ON, 阀 -> u0={u0:.1f}%")
 
         # 等阀指令生效并稳定若干秒
         record_phase(client, config, 5.0, args.interval, "prep", samples, t0,
                      guards=False)
 
+        # ---- 调零: 把 u0 微调到液位基本静止, 保证基线是"平衡点附近"的样本 ----
+        if args.trim:
+            for it in range(TRIM_MAX_ITERS):
+                t_probe = time.time() - t0
+                record_phase(client, config, t_probe + args.probe,
+                             args.interval, "trim", samples, t0)
+                rows = [s for s in samples
+                        if s["phase"] == "trim" and s["t"] >= t_probe - 1e-9]
+                _, slope = linfit([s["t"] for s in rows], [s["pct"] for s in rows])
+                if abs(slope) <= TRIM_TOL:
+                    print(f"  调零到位: 基线斜率 {slope:+.4f} %/s (≤{TRIM_TOL:g})")
+                    break
+                du_fix = max(-TRIM_MAX_DU, min(TRIM_MAX_DU, slope / K_PRIOR))
+                u0 = min(80.0, max(3.0, u0 + du_fix))
+                u1 = min(100.0, max(0.0, u0 + du_step))
+                set_manual_valve(client, config, u0)
+                print(f"  调零 {it + 1}/{TRIM_MAX_ITERS}: 斜率 {slope:+.4f} %/s "
+                      f"-> u0={u0:.1f}%, 阶跃后 {u1:.1f}%")
+
         # ---- 基线 ----
         print("基线记录中...")
-        record_phase(client, config, 5.0 + args.baseline, args.interval,
-                     "baseline", samples, t0)
+        record_phase(client, config, time.time() - t0 + args.baseline,
+                     args.interval, "baseline", samples, t0)
         t_step = time.time() - t0
 
         # ---- 阶跃 ----
         set_manual_valve(client, config, u1)
         print(f"阶跃: 阀 {u0:.1f}% -> {u1:.1f}%, 记录中...")
-        record_phase(client, config, t_step + args.record, args.interval,
+        record_phase(client, config, t_step + record_len, args.interval,
                      "poststep", samples, t0)
 
         # ---- 恢复现场 ----
@@ -323,7 +436,7 @@ def main():
             print(f"已恢复阀={u0:.1f}%, 保持手动模式 (--no-restore-auto 或试验前即手动)")
 
         # ---- 分析 ----
-        r = analyze(samples, t_step, u0, u1)
+        r = analyze(samples, t_step, u0, u1, learned_d0)
         print_report(r, u0, u1)
 
         out = args.out or os.path.join(
@@ -341,6 +454,7 @@ def main():
                 f"step_test_ABORTED_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
             write_csv(samples, out)
             print(f"已中止数据仍写入: {out}", file=sys.stderr)
+        try_analyze(samples, t_step, u0, u1, learned_d0)
         sys.exit(2)
     except KeyboardInterrupt:
         print("\n❌ 用户中断", file=sys.stderr)
@@ -349,6 +463,7 @@ def main():
             write_csv(samples, os.path.join(
                 os.getcwd(),
                 f"step_test_INTERRUPTED_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"))
+        try_analyze(samples, t_step, u0, u1, learned_d0)
         sys.exit(130)
     finally:
         client.close()

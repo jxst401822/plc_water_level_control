@@ -4,7 +4,7 @@
    用法: 整段替换现有 PLC_PRG 的声明区与实现区 (GVL 不变)
 
    相对现行版本的改进 (针对控制超调 / 液位不稳):
-   [G1] 默认增益改为现场验证稳定值 Kp=1.8 Ki=0.30 (原 3.0/0.5 过激)
+   [G1] 默认增益改为保守值 Kp=2.0 Ki=0.10 (临时值, 待 step_test.py 实测定稿)
    [G2] SP 内部斜坡: 上位机阶跃写入的目标在 PLC 内限速逼近 (2%/s),
         纯滞后 τ 内误差不再持续拉大 -> 消除积分饱和型超调;
         对 set-mm/write 直写路径同样生效 (CLI 斜坡之外的第二道防线)
@@ -19,6 +19,24 @@
    [G7] 阀输出速率限制 (10%/s, 仅 PID 路径): 防液压冲击/阀频繁大幅动作;
         联锁与手动路径不限速 (安全动作必须立即执行)
    [G8] 目标水位钳位 0..100%, 防 Modbus 写入越界值
+   [G10] 微分符号修复: 本系统阀在抽水侧 = 反作用对象, 对测量微分应取
+        正号 +(dPV/dt)。原负号是正作用对象(加热/注水)的写法, 启用 Kd 后
+        会加剧而非抑制超调(此前 Kd=0 未暴露)。同时把微分/速率估计移到
+        公共段, 联锁/手动路径也能得到当拍新鲜值。
+   [G11] 上升预开阀 (predictive pre-open): 上升方向无刹车(阀已全关, 只能
+        等自流), 唯一手段是提前抽水。用实测上涨速率算出到达目标剩余时间,
+        当剩余时间 < T_lead 时按比例把阀预开到平衡开度 u_eq, 交接给 PID 时
+        积分跟踪预开值保证输出连续; 抽水一旦超过入流(水位转降)立即退出。
+        这是上升方向防超调的主手段, 对 set-mm/HMI 直写路径同样生效。
+        需标定 3 个参数: rInflowRate(上涨速率) / rUeqEst(平衡开度) /
+        rPreOpenLead(提前量), 标定方法见 docs/ST侧改进说明.md。
+   [G12] 在线自学习 d0 / u_eq: 两个量都是直接可观测量(阀全关时上涨速率=d0;
+        稳态时阀开度=u_eq), 用一阶低通(指数滑动平均)缓慢逼近, 永不跳变。
+        学到的值实时映射到输入寄存器空闲槽(Device_0/1=d0, Device_6/7=u_eq)
+        供上位机 get-learn 读取; 满意后可把 bAutoLearn 置 FALSE 冻结, 或把
+        读到的值写成 rInflowRate/rUeqEst 的默认值(掉电不丢)。
+        水量变化(左桶加水)后自动跟随, 不必重测 —— 这是 rInflowRate/rUeqEst
+        可以手测写死之外的另一种用法, 二者共用同一组变量。
    联锁逻辑 (HH/LL/传感器故障) 与 Modbus 寄存器映射保持不变,
    上位机 water_control_cli.py 无需任何修改即可兼容。
    ============================================================================ *)
@@ -88,6 +106,32 @@ VAR
     rPrevValve   : REAL;               (* [G7] 上周期阀指令, 限速基准 *)
     bFirstScan   : BOOL := TRUE;       (* 首周期初始化标志 *)
 
+    (* ===== [G10][G11] 微分/速率估计 + 上升预开阀 ===== *)
+    (* 微分: 公共段计算, 联锁/手动路径也拿到当拍新鲜值 *)
+    rRateFilt    : REAL;               (* [G10] 上涨速率低通估计 %/s (由 dPV/dt 滤波而来) *)
+    rRateTc      : REAL := 10.0;       (* [G10] 速率估计时间常数 s (兼作水位转降判据的平滑) *)
+    rRateAlpha   : REAL;               (* [G10] 速率滤波系数 *)
+
+    (* [G11] 上升预开阀: 标定这 3 个参数后把 bPreOpenEn 置 TRUE *)
+    bPreOpenEn   : BOOL := FALSE;      (* 使能开关: 三参数未标定前保持 FALSE *)
+    (* [G12] 占用 %MW26-29 供 Modbus 回读学习值(当前映射未用这些地址;
+       若与其它 POU 的 %MW 冲突, 改到空闲地址并同步改下方写出段) *)
+    rInflowRate  AT %MW26 : REAL := 0.30;  (* 自然上涨速率 d0, %/s  —— 手测填入或自学习 *)
+    rUeqEst      AT %MW28 : REAL := 20.0;  (* 平衡阀开度 u_eq, % —— 手测填入或自学习 *)
+    rPreOpenLead : REAL := 20.0;       (* 提前量 T_lead, s —— 取 2τ, τ 由 step_test 实测 *)
+    rTArrive     : REAL;               (* 预计到达目标剩余秒数 *)
+    rPreOpen     : REAL;               (* 预开阀开度 %, 0=不预开 *)
+
+    (* ===== [G12] 在线自学习参数 ===== *)
+    bAutoLearn     : BOOL := TRUE;     (* 自学习总开关: 学到的值满意后可置 FALSE 冻结 *)
+    rLearnTcD0     : REAL := 30.0;     (* d0 学习时间常数 s (越小跟得越快, 噪声越大) *)
+    rLearnTcUeq    : REAL := 60.0;     (* u_eq 学习时间常数 s (稳态学习, 取更慢更稳) *)
+    rLearnAlphaD0  : REAL;             (* 本拍 d0 学习系数 *)
+    rLearnAlphaUeq : REAL;             (* 本拍 u_eq 学习系数 *)
+    rD0LearnMin    : REAL := 0.02;     (* d0 学习门槛: 观测速率须 > 此值 %/s (避开噪声与近平衡点) *)
+    rUeqSettleE    : REAL := 1.0;      (* u_eq 学习门槛: |误差| < 此值 % (约 1.3mm) 才算稳态 *)
+    rUeqSettleRate : REAL := 0.05;     (* u_eq 学习门槛: |速率| < 此值 %/s 才算稳态 *)
+
     (* ===== 临时量 ===== *)
     rSpRaw    : REAL;                  (* [G8] 钳位后的原始目标 *)
     rAlpha    : REAL;                  (* [G3] 滤波系数 *)
@@ -149,6 +193,17 @@ END_IF
 rAlpha  := rDt / (rPvTc + rDt);
 rPvFilt := rPvFilt + rAlpha * (GVL.rLevel - rPvFilt);
 
+(* ---------- 1a2. [G10] 微分与上涨速率估计 (公共段, 各路径共用当拍新鲜值) ----------
+   [G10] 微分符号: 本系统阀在抽水侧 = 反作用对象, 水位在涨时应开大阀刹车,
+   故对测量微分取正号 +dPV/dt。教科书里的 -Kd·dPV/dt 是正作用对象(加热/注水)
+   的写法, 用在这里符号相反, 启用 Kd 会加剧超调。 *)
+rDeriv := (rPvFilt - rPrevLevel) / rDt;
+rPrevLevel := rPvFilt;
+
+(* [G11] 上涨速率低通估计 (供预开阀判断"水位是否仍在涨") *)
+rRateAlpha := rDt / (rRateTc + rDt);
+rRateFilt  := rRateFilt + rRateAlpha * (rDeriv - rRateFilt);
+
 (* ---------- 1b. [G2] SP 内部斜坡: 阶跃目标限速逼近 ---------- *)
 rSpRaw := GVL.rTargetLevel;   (* 已钳位 *)
 IF rSpRamp < rSpRaw THEN
@@ -175,10 +230,8 @@ ELSIF (GVL.rLevel <= rLvlLL) THEN
     rITerm    := 0.0;
 ELSE
     (* ---------- 3. PID (阀在抽水侧: 偏高->开阀抽水) ---------- *)
-    (* [G2] 误差用斜坡后的 SP; [G3] PV 用滤波值 *)
+    (* [G2] 误差用斜坡后的 SP; [G3] PV 用滤波值; [G10] rDeriv 已在公共段算好 *)
     rError := rPvFilt - rSpRamp;                   (* PV - SP, 正=偏高需抽水 *)
-    (* [G4] 对测量微分: SP 阶跃/斜坡拐点不产生微分踢, 只响应水位实际变化 *)
-    rDeriv := -(rPvFilt - rPrevLevel) / rDt;
     rPD    := rKp * rError + rKd * rDeriv;
 
     (* [G5][G9] 抗积分饱和: 先算候选输出判饱和, 未饱和才累积积分贡献量,
@@ -192,6 +245,26 @@ ELSE
     rOut := rPD + rITerm;                          (* 用更新后的 rITerm *)
     GVL.rValveCmd := LIMIT(0.0, rOut, 100.0);
 
+    (* ---------- 3a. [G11] 上升预开阀: 提前抽水, 消除上升方向超调 ----------
+       上升时阀已全关(误差为负 → 输出饱和在 0), 系统只能靠自流被动上涨,
+       没有减速手段; 唯一办法是在到达目标之前就开阀抽水。
+       剩余时间 = (SP − PV) / d0 (d0 为实测上涨速率);
+       剩余时间 < T_lead 时按比例把阀预开到平衡开度 u_eq。
+       退出条件: 水位转降(rRateFilt ≤ 0, 说明抽水已超过入流) 或 已到/超过目标。
+       预开生效时把积分跟踪到预开值, 保证交接给 PID 时输出连续不跳变。 *)
+    rPreOpen := 0.0;
+    IF bPreOpenEn AND (rInflowRate > 0.01)
+       AND (rError < 0.0) AND (rRateFilt > 0.0) THEN
+        rTArrive := (rSpRamp - rPvFilt) / rInflowRate;
+        IF rTArrive < rPreOpenLead THEN
+            rPreOpen := rUeqEst * (1.0 - MAX(0.0, rTArrive) / rPreOpenLead);
+            IF rPreOpen > GVL.rValveCmd THEN
+                GVL.rValveCmd := rPreOpen;
+                rITerm := LIMIT(rILimLo, rPreOpen - rPD, rILimHi);
+            END_IF
+        END_IF
+    END_IF
+
     (* [G7] 阀输出速率限制 (仅 PID 路径, 联锁/手动不限速):
        每周期最多变化 rValveRate*rDt (默认 10%/s = 1%/周期) *)
     rValveDelta := rValveRate * rDt;
@@ -201,7 +274,6 @@ ELSE
         GVL.rValveCmd := rPrevValve - rValveDelta;
     END_IF
     rPrevValve   := GVL.rValveCmd;
-    rPrevLevel   := rPvFilt;
 
     (* ---------- 4. 泵启停迟滞 (保护继电器+防憋压) ---------- *)
     IF bPumpCmd THEN
@@ -219,9 +291,35 @@ IF NOT bAuto THEN
        不再除以 Ki (旧写法在 Ki=0 时失效, 且量纲随 Ki 漂移) *)
     rITerm := GVL.rValveCmd - (rKp * (rPvFilt - rSpRamp) + rKd * rDeriv);
     rITerm := LIMIT(rILimLo, rITerm, rILimHi);
-    (* 手动期间同步限速基准与微分基准, 切回自动无扰 *)
+    (* 手动期间同步限速基准, 切回自动无扰 (微分基准 rPrevLevel 已在公共段更新) *)
     rPrevValve := GVL.rValveCmd;
-    rPrevLevel := rPvFilt;
+END_IF
+
+(* ---------- 5a. [G12] 在线自学习: d0 与 u_eq ----------
+   原理: 两个量都是直接可观测量 ——
+     d0  : 阀全关(抽水=0)时, 水位上涨速率就是 d0;
+     u_eq: 稳态(|误差|小 且 不再漂移)时, 阀开度就是平衡开度 u_eq。
+   学习方法 = 一阶低通(指数滑动平均): 每拍把估计值往观测量挪 α 比例,
+   α = 周期/(时间常数+周期) ≈ 0.003 —— 永不跳变, 单个噪声样本只影响 α 比例;
+   指数收敛(30s 时间常数: 60s 后误差 ~14%, 90s 后 ~5%); 工况变化自动跟随。
+   门控: 只在"抽水=0"时学 d0, 只在"真稳"时学 u_eq, 避免用被自己扰动过的数据学习。
+   注意: 预开阀一动作阀开度就 >1%, d0 学习自动停止 —— 自洽。 *)
+IF bAutoLearn AND bAuto AND NOT bSensorFault
+   AND (GVL.rLevel < rLvlHH) AND (GVL.rLevel > rLvlLL) THEN
+
+    (* d0: 阀基本全关 且 水位确实在涨 → 此刻净速率 = d0 *)
+    rLearnAlphaD0 := rDt / (rLearnTcD0 + rDt);
+    IF (GVL.rValveCmd < 1.0) AND (rRateFilt > rD0LearnMin) THEN
+        rInflowRate := LIMIT(0.01,
+            rInflowRate + rLearnAlphaD0 * (rRateFilt - rInflowRate), 5.0);
+    END_IF
+
+    (* u_eq: 已到目标附近 且 已稳 → 此刻阀开度 = 平衡开度 *)
+    rLearnAlphaUeq := rDt / (rLearnTcUeq + rDt);
+    IF (ABS(rError) < rUeqSettleE) AND (ABS(rRateFilt) < rUeqSettleRate) THEN
+        rUeqEst := LIMIT(0.0,
+            rUeqEst + rLearnAlphaUeq * (GVL.rValveCmd - rUeqEst), rILimHi);
+    END_IF
 END_IF
 
 (* ---------- 6. 输出标定与写入 ---------- *)
@@ -250,3 +348,8 @@ qwModbusTCP_Server_Device_12 := %MW22;   (* rKi 低字 *)
 qwModbusTCP_Server_Device_13 := %MW23;   (* rKi 高字 *)
 qwModbusTCP_Server_Device_14 := %MW24;   (* rKd 低字 *)
 qwModbusTCP_Server_Device_15 := %MW25;   (* rKd 高字 *)
+(* [G12] 自学习值回读 (占用输入寄存器空闲槽 0/1 与 6/7, 无需改数组大小) *)
+qwModbusTCP_Server_Device_0 := %MW26;    (* 学习到的 d0 低字 *)
+qwModbusTCP_Server_Device_1 := %MW27;    (* 学习到的 d0 高字 *)
+qwModbusTCP_Server_Device_6 := %MW28;    (* 学习到的 u_eq 低字 *)
+qwModbusTCP_Server_Device_7 := %MW29;    (* 学习到的 u_eq 高字 *)

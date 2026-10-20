@@ -28,10 +28,13 @@ the pump cannot evacuate further even though the sensor reads lower.
 """
 
 import argparse
+import csv
 import struct
 import json
 import os
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
 
 from pymodbus.client import ModbusTcpClient
@@ -81,6 +84,9 @@ IREG_KP = 10             # rKp 反馈 (PLC 实际在用值) 只读
 IREG_KI = 12             # rKi 反馈 只读
 IREG_KD = 14             # rKd 反馈 只读
 IREG_STATUS = 8          # 状态位打包字 (FC04), PLC: bit0=bAuto,1=bPumpCmd,2=bSensorFault,3=bAlarm,4=bPump
+# [G12] PLC 自学习值回读 (ST 把学习值映射到输入寄存器空闲槽 0/1 与 6/7)
+IREG_INFLOW = 0          # 学习到的自然上涨速率 d0 (%/s) 只读
+IREG_UEQ = 6             # 学习到的平衡阀开度 u_eq (%) 只读
 
 # 状态字位定义 (与 PLC qwModbusTCP_Server_Device_8 打包一致)
 ST_AUTO = 0x01           # bit0 bAuto
@@ -472,6 +478,26 @@ def cmd_get_pid(args, config):
         client.close()
 
 
+def cmd_get_learn(args, config):
+    """读 PLC 自学习到的 d0 / u_eq (输入寄存器空闲槽 0/1 与 6/7, [G12])。
+
+    用于观察自学习收敛情况, 以及把学到的值抄进 ST 默认值长期固化。
+    """
+    client = connect_plc(config)
+    try:
+        d0 = read_input_real(client, IREG_INFLOW, config["slave_id"])
+        ueq = read_input_real(client, IREG_UEQ, config["slave_id"])
+        print(f"学习到的 d0   = {d0:.4f} %/s   (自然上涨速率)")
+        print(f"学习到的 u_eq = {ueq:.4f} %     (平衡阀开度)")
+        if ueq > 1.0 and d0 > 0.005:
+            print(f"  由此推得工作带对象增益 K = d0/u_eq = {d0 / ueq:.5f} "
+                  f"%/s per %阀 (step_test 实测 K 应与此同量级)")
+        print("  note: 未收敛/未启用自学习时显示默认值; 满意后可把此值写入")
+        print("        st/PLC_PRG_improved.st 的 rInflowRate / rUeqEst 默认值")
+    finally:
+        client.close()
+
+
 def cmd_status(args, config):
     """Show all PLC status."""
     client = connect_plc(config)
@@ -504,6 +530,73 @@ def cmd_status(args, config):
         print(f"(cal: {npts}-pt interp, range {lo:g}-{hi:g} mm, status word=0x{sw:02X})")
     finally:
         client.close()
+
+
+def cmd_trend(args, config):
+    """趋势记录: 周期采样液位/阀指令/泵状态, 写 CSV 并逐行打印。
+
+    用于观察漂移与振荡: 波动带、周期、阀-液位相位关系。
+    Ctrl+C 提前结束仍会写出已采数据与统计。
+    """
+    duration = args.duration
+    interval = max(0.5, args.interval)
+    out_path = args.out or os.path.join(
+        os.getcwd(), f"trend_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+    sid = config["slave_id"]
+    client = connect_plc(config)
+    rows = []
+    print(f"记录 {duration:.0f}s, 间隔 {interval:g}s -> {out_path}  (Ctrl+C 提前结束)")
+    t0 = time.time()
+    try:
+        while True:
+            t = time.time() - t0
+            if t >= duration:
+                break
+            target = read_real(client, REG_TARGET_LEVEL, sid)
+            level = read_input_real(client, IREG_LEVEL, sid)
+            valve = read_input_real(client, IREG_VALVE_CMD, sid)
+            sw = read_status_word(client, sid)
+            mm = pct_to_mm(level, config)
+            rows.append((f"{t:.1f}", f"{mm:.2f}", f"{level:.2f}",
+                         f"{valve:.2f}", f"{target:.2f}", f"0x{sw:04X}"))
+            print(f"  t={t:6.1f}s  level={mm:6.1f}mm ({level:5.1f}%)  "
+                  f"valve={valve:5.1f}%  pump={'ON ' if sw & ST_PUMP else 'OFF'}")
+            # 扣除本次读取耗时, 保持采样间隔稳定
+            time.sleep(max(0.0, t + interval - (time.time() - t0)))
+    except KeyboardInterrupt:
+        print("\n中断, 统计已采集数据")
+    finally:
+        client.close()
+
+    if rows:
+        with open(out_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["t_s", "level_mm", "level_pct", "valve_pct",
+                        "target_pct", "status"])
+            w.writerows(rows)
+        ts = [float(r[0]) for r in rows]
+        mms = [float(r[1]) for r in rows]
+        pcts = [float(r[2]) for r in rows]
+        valves = [float(r[3]) for r in rows]
+        n = len(rows)
+
+        def _slope(ys):
+            """最小二乘斜率 dy/dt (纯标准库)。"""
+            mt, my = sum(ts) / n, sum(ys) / n
+            sxx = sum((t - mt) ** 2 for t in ts)
+            sxy = sum((t - mt) * (y - my) for t, y in zip(ts, ys))
+            return sxy / sxx if sxx else 0.0
+
+        print(f"\n采样 {n} 点, 时长 {ts[-1]:.0f}s -> {out_path}")
+        print(f"液位: min={min(mms):.1f}  max={max(mms):.1f}  "
+              f"mean={sum(mms)/n:.1f} mm  波动带={max(mms)-min(mms):.1f} mm")
+        print(f"液位速率(拟合): {_slope(mms):+.3f} mm/s  ({_slope(pcts):+.4f} %/s)"
+              f"   <- 阀全关时即自然上涨速率 d0")
+        print(f"阀指令: min={min(valves):.1f}  max={max(valves):.1f}  "
+              f"mean={sum(valves)/n:.1f}%  摆幅={max(valves)-min(valves):.1f} pp"
+              f"   <- 稳态时 mean 即平衡开度 u_eq")
+    else:
+        print("未采集到数据")
 
 
 def cmd_set_ip(args, config):
@@ -597,6 +690,15 @@ def main():
     # status command
     subparsers.add_parser("status", help="Show all PLC status (with mm)")
 
+    # trend command (level/valve logging for drift & oscillation diagnosis)
+    trend_parser = subparsers.add_parser("trend", help="Record level/valve trend to CSV")
+    trend_parser.add_argument("--duration", type=float, default=300.0,
+                              help="record duration in seconds (default 300)")
+    trend_parser.add_argument("--interval", type=float, default=2.0,
+                              help="sample interval in seconds (default 2)")
+    trend_parser.add_argument("--out", type=str, default=None,
+                              help="CSV output path (default ./trend_<ts>.csv)")
+
     # read-raw command (debug byte order / address)
     raw_parser = subparsers.add_parser("read-raw", help="Dump raw registers for debugging")
     raw_parser.add_argument("address", type=int, nargs="?", help="Start address (default %%MW0)")
@@ -619,6 +721,7 @@ def main():
     setpid_parser.add_argument("ki", type=float, help="Integral gain")
     setpid_parser.add_argument("kd", type=float, help="Derivative gain")
     subparsers.add_parser("get-pid", help="Read PID gains the PLC is using")
+    subparsers.add_parser("get-learn", help="Read PLC self-learned d0 / u_eq")
 
     # set-ip command
     ip_parser = subparsers.add_parser("set-ip", help="Set PLC IP address")
@@ -650,6 +753,7 @@ def main():
         "raise": cmd_raise_lower,
         "lower": cmd_raise_lower,
         "status": cmd_status,
+        "trend": cmd_trend,
         "read-raw": cmd_read_raw,
         "auto": cmd_auto,
         "manual": cmd_manual,
@@ -657,6 +761,7 @@ def main():
         "valve": cmd_valve,
         "set-pid": cmd_set_pid,
         "get-pid": cmd_get_pid,
+        "get-learn": cmd_get_learn,
         "set-ip": cmd_set_ip,
         "set-scale": cmd_set_scale,
     }
