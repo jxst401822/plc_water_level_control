@@ -62,6 +62,10 @@ DEFAULT_CONFIG = {
         [16587, 131.0],
         [20000, 158.0],
     ],
+    # 线性模型 (优先于点表): mm = k*(iLevelRaw-4000) + b
+    # k 由上述 5 点最小二乘拟合 (残差 <2.2mm) —— 传感器/桶形的固有斜率, 不随漂移变
+    # b 是"4mA 对应多少 mm", 每次 calibrate 只更新它
+    "level_model": {"k": 0.0087683, "b": 19.8},
 }
 
 # ---- 两套地址空间 ----
@@ -84,9 +88,13 @@ IREG_KP = 10             # rKp 反馈 (PLC 实际在用值) 只读
 IREG_KI = 12             # rKi 反馈 只读
 IREG_KD = 14             # rKd 反馈 只读
 IREG_STATUS = 8          # 状态位打包字 (FC04), PLC: bit0=bAuto,1=bPumpCmd,2=bSensorFault,3=bAlarm,4=bPump
-# [G12] PLC 自学习值回读 (ST 把学习值映射到输入寄存器空闲槽 0/1 与 6/7)
-IREG_INFLOW = 0          # 学习到的自然上涨速率 d0 (%/s) 只读
-IREG_UEQ = 6             # 学习到的平衡阀开度 u_eq (%) 只读
+IREG_LEVEL_RAW = 9       # iLevelRaw 原始计数 (4000..20000), 校准量程用; 旧 PLC 程序未映射时读到 0
+# [v2] PLC 前馈参数回读 (ST 把它们映射到输入寄存器空闲槽 0/1 与 6/7)
+IREG_UEQC = 0            # 平衡线截距 C (%阀开度), PLC 在线学习; u_eq(SP) = C - SP/STAT_K
+IREG_UEQ = 6             # 当前目标的平衡开度 u_eq (%) —— PLC 每拍派生
+# 自衡对象静态增益 |K| (%液位 per %阀), 2026-10-20 阶跃试验实测
+STAT_K = 2.13
+IREG_INFLOW = IREG_UEQC  # 兼容旧名(旧版这一槽是 d0, v2 起改为 C)
 
 # 状态字位定义 (与 PLC qwModbusTCP_Server_Device_8 打包一致)
 ST_AUTO = 0x01           # bit0 bAuto
@@ -123,6 +131,21 @@ def save_config(config: dict):
 # 传感器有非线性, 用实测点表 (iLevelRaw, mm) 分段线性插值, 段内残差<0.1mm。
 # 段外按最近段斜率线性外推。点表在 config["level_cal_points"], 按 iLevelRaw 升序。
 
+def _model(config: dict):
+    """线性模型 {"k","b"} 或 None; mm = k*(raw-4000) + b。"""
+    m = config.get("level_model")
+    return m if m and "k" in m and "b" in m else None
+
+
+def _model_k(config: dict) -> float:
+    """当前使用的斜率 (mm/计数), 线性模型优先, 否则由点表首段估。"""
+    m = _model(config)
+    if m:
+        return m["k"]
+    pts = _cal_points(config)
+    return (pts[1][1] - pts[0][1]) / (pts[1][0] - pts[0][0])
+
+
 def _cal_points(config: dict) -> list:
     """返回 [(iLevelRaw, mm), ...], 按 iLevelRaw 升序。"""
     pts = config.get("level_cal_points", DEFAULT_CONFIG["level_cal_points"])
@@ -130,7 +153,10 @@ def _cal_points(config: dict) -> list:
 
 
 def _cal_range_mm(config: dict):
-    """返回 (min_mm, max_mm) 标定范围(首末点), 用于命令参数范围校验。"""
+    """返回 (min_mm, max_mm) 标定范围, 用于命令参数范围校验。"""
+    m = _model(config)
+    if m:
+        return m["k"] * 0.0 + m["b"], m["b"] + m["k"] * 16000.0
     pts = _cal_points(config)
     return pts[0][1], pts[-1][1]
 
@@ -183,14 +209,20 @@ def _interp_raw(mm: float, pts: list) -> float:
 
 
 def mm_to_pct(mm: float, config: dict) -> float:
-    """毫米 -> PLC 百分比 (分段插值反解)。"""
+    """毫米 -> PLC 百分比 (线性模型优先, 否则分段插值反解)。"""
+    m = _model(config)
+    if m:
+        return ((mm - m["b"]) / m["k"]) / 160.0
     pts = _cal_points(config)
     raw = _interp_raw(mm, pts)
     return (raw - 4000) / 16000.0 * 100.0
 
 
 def pct_to_mm(pct: float, config: dict) -> float:
-    """PLC 百分比 -> 毫米 (分段插值)。"""
+    """PLC 百分比 -> 毫米 (线性模型优先, 否则分段插值)。"""
+    m = _model(config)
+    if m:
+        return m["k"] * (pct * 160.0) + m["b"]
     pts = _cal_points(config)
     raw = pct / 100.0 * 16000.0 + 4000
     return _interp_mm(raw, pts)
@@ -437,6 +469,139 @@ def cmd_valve(args, config):
         client.close()
 
 
+def _quiescent_report(client, config, settle=5.0, samples=5):
+    """静水确认: 回读阀/泵状态, 再看液位是否真的不动了。
+
+    返回 (ok, drift_mm)。ok=False 有两种原因, 分开报:
+      - PLC 侧没执行(阀仍开/泵仍转) —— 多半是 HH 联锁在强制抽水
+      - PLC 侧已全关但液位仍在变 —— 上方左右桶连通没阻断, 或在漏水
+    """
+    sid = config["slave_id"]
+    sw = read_status_word(client, sid)
+    valve = read_input_real(client, IREG_VALVE_CMD, sid)
+    pump_on = bool(sw & ST_PUMP) or bool(sw & ST_PUMP_CMD)
+    print(f"回读: 阀指令 {valve:.1f}%   泵 {'ON' if pump_on else 'OFF'}   "
+          f"自动 {'ON' if (sw & ST_AUTO) else 'OFF(手动)'}")
+    if pump_on or valve > 1.0:
+        if sw & ST_SENSOR_FAULT:
+            print("⚠️ 传感器故障联锁生效中(阀应为 0), 先查探头接线", file=sys.stderr)
+        elif sw & ST_ALARM:
+            print("⚠️ PLC 安全联锁在覆盖手动指令 —— 液位高于 rLvlHH(95%) 时会强制"
+                  "阀 100% + 泵 ON。这是设计行为, 手动/stop 都盖不住它。"
+                  "要真正静止, 先把液位降到 HH 以下(或临时抬高 rLvlHH)。",
+                  file=sys.stderr)
+        else:
+            print("⚠️ 指令已写但 PLC 未执行(阀仍开或泵仍转)", file=sys.stderr)
+        return False, None
+
+    # 液位漂移检查: 全关之后液位只应随温度/毛细缓慢变化
+    if settle <= 0 or samples < 2:
+        return True, 0.0
+    raws = []
+    for i in range(samples):
+        raws.append(read_level_raw(client, sid))
+        if i < samples - 1:
+            time.sleep(settle / (samples - 1))
+    if raws[0] == 0:
+        print("  (iLevelRaw 未映射, 跳过漂移检查)")
+        return True, None
+    drift = (raws[-1] - raws[0]) * _model_k(config)
+    span = (max(raws) - min(raws)) * _model_k(config)
+    print(f"漂移检查({settle:g}s, {samples} 次): raw {raws[0]} -> {raws[-1]}   "
+          f"净漂移 {drift:+.2f}mm   峰峰 {span:.2f}mm")
+    if abs(drift) > 1.0 or span > 3.0:
+        print("⚠️ 液位仍在移动 —— 泵和阀都已关闭, 说明**上方左右桶连通没阻断**"
+              "(或桶体/管路在漏水)。此时做校准或阶跃测量都会失真。", file=sys.stderr)
+        return False, drift
+    print("✅ 系统已静止: 上下都封闭, 液位不动。可以校准/采样。")
+    return True, drift
+
+
+def cmd_stop(args, config):
+    """把装置置于全静止: 泵 OFF + 阀 0% + 切手动。上方连通由现场人工阻断。
+
+    写入顺序有讲究: 先写 rManualValve=0 与 bManualPump=0, **最后**才清 bAuto。
+    手动段的阀指令没有速率限制(rValveRate 只作用于自动路径), 若先切手动而
+    rManualValve 还是旧值, 阀会一步跳到那个值。
+    """
+    client = connect_plc(config)
+    try:
+        sid = config["slave_id"]
+        before_valve = read_input_real(client, IREG_VALVE_CMD, sid)
+        before_lvl = read_input_real(client, IREG_LEVEL, sid)
+        ueq = read_input_real(client, IREG_UEQ, sid)
+        print(f"stop 前: 液位 {pct_to_mm(before_lvl, config):.1f}mm ({before_lvl:.1f}%)  "
+              f"阀 {before_valve:.1f}%")
+        print(f"  记下这个平衡开度: u_eq(当前目标) = {ueq:.1f}%  ← resume 会用它预置积分")
+
+        write_real(client, REG_MANUAL_VALVE, 0.0, sid)      # 1. 手动阀归零
+        set_control_bit(client, CTL_MANUAL_PUMP, False, sid)  # 2. 手动泵 OFF
+        word = set_control_bit(client, CTL_AUTO, False, sid)  # 3. 最后切手动
+        print(f"已写: rManualValve=0.0%  bManualPump=OFF  bAuto=OFF "
+              f"(control word=0x{word:04X})")
+        print("  现场动作: 阻断设备上方左右桶的连通(关阀/夹管/抬管)")
+
+        time.sleep(0.4)                                     # 等 >=1 个 PLC 周期(100ms)
+        ok, _ = _quiescent_report(client, config,
+                                  settle=args.settle, samples=args.samples)
+        if not ok and not args.force:
+            sys.exit(2)
+        print("下一步: 校准 → calibrate --sample --label low|high ;  "
+              "恢复运行 → resume")
+    finally:
+        client.close()
+
+
+def cmd_resume(args, config):
+    """从 stop 恢复到自动运行, 并预置积分避免冷启动超调。
+
+    直接 `auto` 会让 rITerm 从 0 开始爬。自衡对象的平衡开度约 27%, 而积分在
+    小误差下只能以 Ki*|e| ≈ 0.1pp/s 的速度累加, 爬满要 4~5 分钟 —— 这期间阀
+    接近全关, 液位一路涨过目标。
+    所以先把 rManualValve 写成 PLC 报出的 u_eq, 等一个周期让手动段把 rITerm
+    跟踪到该值(无扰切换), 再置 bAuto。
+    """
+    client = connect_plc(config)
+    try:
+        sid = config["slave_id"]
+        preload = args.valve
+        if preload is None:
+            preload = read_input_real(client, IREG_UEQ, sid)
+            if preload <= 0.0:
+                print("⚠️ PLC 报出的 u_eq = 0(前馈/观测器未映射或未学习), "
+                      "无法预置积分。用 resume --valve <开度> 手动指定", file=sys.stderr)
+        preload = max(0.0, min(100.0, preload))
+        target = read_real(client, REG_TARGET_LEVEL, sid)
+        lvl = read_input_real(client, IREG_LEVEL, sid)
+        print(f"当前: 液位 {pct_to_mm(lvl, config):.1f}mm ({lvl:.1f}%)  "
+              f"目标 {pct_to_mm(target, config):.1f}mm ({target:.1f}%)")
+        print(f"预置: rManualValve = {preload:.1f}% (平衡开度 u_eq), "
+              f"等 PLC 把 rITerm 跟踪到该值后再切自动")
+
+        write_real(client, REG_MANUAL_VALVE, preload, sid)
+        set_control_bit(client, CTL_MANUAL_PUMP, False, sid)
+        sw0 = read_status_word(client, sid)
+        if sw0 & ST_AUTO:
+            # 已经是自动: 必须先落到手动, 手动段才会把 rITerm 跟踪到 preload
+            set_control_bit(client, CTL_AUTO, False, sid)
+            print("  (当前是自动模式, 先切手动以便预置积分)")
+        time.sleep(max(0.5, args.hold))          # 手动段每拍跟踪 rITerm, 0.5s = 5 拍
+        word = set_control_bit(client, CTL_AUTO, True, sid)
+        print(f"已切自动 (control word=0x{word:04X})")
+        print("  现场动作: 恢复设备上方左右桶的连通")
+
+        time.sleep(1.0)
+        sw = read_status_word(client, sid)
+        valve = read_input_real(client, IREG_VALVE_CMD, sid)
+        print(f"回读: 自动 {'ON' if (sw & ST_AUTO) else 'OFF'}  阀 {valve:.1f}%  "
+              f"泵 {'ON' if (sw & ST_PUMP or sw & ST_PUMP_CMD) else 'OFF'}")
+        if not (sw & ST_AUTO):
+            print("⚠️ bAuto 没置上", file=sys.stderr)
+            sys.exit(2)
+    finally:
+        client.close()
+
+
 def cmd_set_pid(args, config):
     """Write PID gains and enable Modbus tuning (control word bit2 = bPidTune).
 
@@ -479,21 +644,341 @@ def cmd_get_pid(args, config):
 
 
 def cmd_get_learn(args, config):
-    """读 PLC 自学习到的 d0 / u_eq (输入寄存器空闲槽 0/1 与 6/7, [G12])。
+    """读 PLC 的前馈参数: 平衡线截距 C 与当前目标的平衡开度 u_eq。
 
-    用于观察自学习收敛情况, 以及把学到的值抄进 ST 默认值长期固化。
+    自衡对象: u_eq(SP) = C - SP/STAT_K。C 随两桶装水量整体平移, 由 PLC 在线学习;
+    实测参考值 49(10-19) / 58(10-20) / 52.4(10-21)。
     """
     client = connect_plc(config)
     try:
-        d0 = read_input_real(client, IREG_INFLOW, config["slave_id"])
+        c_plc = read_input_real(client, IREG_UEQC, config["slave_id"])
         ueq = read_input_real(client, IREG_UEQ, config["slave_id"])
-        print(f"学习到的 d0   = {d0:.4f} %/s   (自然上涨速率)")
-        print(f"学习到的 u_eq = {ueq:.4f} %     (平衡阀开度)")
-        if ueq > 1.0 and d0 > 0.005:
-            print(f"  由此推得工作带对象增益 K = d0/u_eq = {d0 / ueq:.5f} "
-                  f"%/s per %阀 (step_test 实测 K 应与此同量级)")
-        print("  note: 未收敛/未启用自学习时显示默认值; 满意后可把此值写入")
-        print("        st/PLC_PRG_improved.st 的 rInflowRate / rUeqEst 默认值")
+        level = read_input_real(client, IREG_LEVEL, config["slave_id"])
+        valve = read_input_real(client, IREG_VALVE_CMD, config["slave_id"])
+        target = read_real(client, REG_TARGET_LEVEL, config["slave_id"])
+        print(f"C    = {c_plc:.4f} %    (平衡线截距, PLC 在线学习)")
+        print(f"u_eq = {ueq:.4f} %    (目标 {target:.1f}% 对应的平衡开度)")
+        print(f"当前: 液位 {level:.2f}% ({pct_to_mm(level, config):.1f}mm)  "
+              f"阀指令 {valve:.2f}%")
+        c_chk = ueq + target / STAT_K
+        print(f"一致性校验: u_eq + SP/{STAT_K} = {c_chk:.2f}  "
+              f"(应与 C 相符, 差 {c_chk - c_plc:+.2f})")
+        if ueq > 1.0:
+            print(f"  阀 {valve:.2f}% vs 平衡 {ueq:.2f}% → 液位将 "
+                  f"{'下降' if valve > ueq + 0.5 else ('上升' if valve < ueq - 0.5 else '保持')}")
+        print("  note: C 随两桶装水量平移, PLC 自动跟随(EMA 300s); "
+              "要固化就抄进 ST 的 rUeqC 默认值")
+    finally:
+        client.close()
+
+
+def read_level_raw(client: ModbusTcpClient, slave_id: int) -> int:
+    """Read iLevelRaw (raw 4-20mA counts) from INPUT register slot 9.
+
+    PLC 侧需有 qwModbusTCP_Server_Device_9 := INT_TO_WORD(iLevelRaw)。
+    旧程序没映射时读回 0 —— 调用方据此判断"不可用"而不是当成真实水位。
+    """
+    result = client.read_input_registers(address=IREG_LEVEL_RAW, count=1, slave=slave_id)
+    if result.isError():
+        raise Exception(f"Read iLevelRaw error (FC04) at {IREG_LEVEL_RAW}: {result}")
+    return result.registers[0]
+
+
+def cmd_read_level_raw(args, config):
+    """打印 iLevelRaw 原始计数 + 由标定表换算出的 % 与 mm, 供现场校准量程。
+
+    校准流程: 量出实际水位 → 若与这里报的 mm 不符 → set-scale add <raw> <实测mm>。
+    """
+    client = connect_plc(config)
+    try:
+        raw = read_level_raw(client, config["slave_id"])
+        if raw == 0:
+            print("Error: PLC 回读的 iLevelRaw = 0, 说明当前程序未映射 "
+                  "qwModbusTCP_Server_Device_9。请在 PLC_PRG 末尾加一行:\n"
+                  "  qwModbusTCP_Server_Device_9 := INT_TO_WORD(iLevelRaw);\n"
+                  "然后重新编译下载。")
+            sys.exit(1)
+        pct = (raw - 4000) / 16000.0 * 100.0
+        mm = pct_to_mm(pct, config)
+        print(f"iLevelRaw     = {raw}  (0x{raw:04X})")
+        print(f"rLevel        = {pct:.2f} %")
+        print(f"换算水位      = {mm:.1f} mm")
+        print(f"模型          = {_describe_model(config)}")
+        if not (4000 <= raw <= 20000):
+            print(f"⚠️ 超出 4-20mA 范围 (4000..20000): 传感器断路/短路或量程配置不对",
+                  file=sys.stderr)
+        print("校准: 量一下实际水位, 若与上面不符 →")
+        print(f"  python3 water_control_cli.py calibrate --actual <实测mm>")
+    finally:
+        client.close()
+
+
+def _read_raw_settled(client, config, n=3, gap=1.0, force=False):
+    """连读 n 次 iLevelRaw, 返回 (中位数, 抖动 mm)。抖动过大 = 水位没稳。"""
+    sid = config["slave_id"]
+    vals = []
+    for i in range(n):
+        vals.append(read_level_raw(client, sid))
+        if i < n - 1:
+            time.sleep(gap)
+    vals.sort()
+    med = vals[len(vals) // 2]
+    spread = (vals[-1] - vals[0]) * _model_k(config)
+    if spread > 3.0 and not force:
+        raise SystemExit(
+            f"Error: {n} 次读数抖动 {spread:.1f}mm (>3mm), 水位未稳, 拒绝校准。"
+            "等 level/trend 平稳后重试, 或确认无误后加 --force")
+    return med, spread
+
+
+def _describe_model(config):
+    m = _model(config)
+    if not m:
+        return "分段点表 (level_cal_points), 未启用线性模型"
+    return f"线性 mm = {m['k']:.7f}*(raw-4000) + {m['b']:.2f}"
+
+
+def _fit_line(pts):
+    """最小二乘拟合 mm = k*(raw-4000) + b。pts = [(raw, mm), ...]，至少 2 点。
+
+    返回 (k, b, residuals)。2 点时残差恒为 0(2 点解 2 未知数, 零冗余 —— 残差
+    不构成任何检验); **3 点起才有 1 个自由度**, 残差才真正能查出量错的点或非线性。
+    """
+    xs = [float(r) - 4000.0 for r, _ in pts]
+    ys = [float(m) for _, m in pts]
+    n = len(pts)
+    sx, sy = sum(xs), sum(ys)
+    sxx = sum(x * x for x in xs)
+    sxy = sum(x * y for x, y in zip(xs, ys))
+    den = n * sxx - sx * sx
+    if abs(den) < 1e-9:
+        return None, None, None
+    k = (n * sxy - sx * sy) / den
+    b = (sy - k * sx) / n
+    res = [y - (k * x + b) for x, y in zip(xs, ys)]
+    return k, b, res
+
+
+def _confirm(prompt):
+    try:
+        return input(f"{prompt} [y/N] ").strip().lower() in ("y", "yes")
+    except EOFError:
+        return False
+
+
+def _save_model(config, k, b):
+    config["level_model"] = {"k": round(k, 9), "b": round(b, 4)}
+    hist = config.get("level_cal_history", [])
+    hist.append({"time": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                 "k": round(k, 9), "b": round(b, 4)})
+    config["level_cal_history"] = hist[-20:]
+    save_config(config)
+
+
+def cmd_calibrate(args, config):
+    """量程校准: 斜率 K 固定, 只用实测水位修正截距 b。
+
+    模型 mm = K*(iLevelRaw-4000) + b。压力探头打湿/温度/零点漂移只会整体平移
+    这条直线(改 b), 不会改斜率(改 K) —— 所以日常校准只动 b。
+    K 只在换探头/改管路/出现"两端误差反号"时用 --two-point 重拟合。
+    """
+    cur = _model(config) or dict(DEFAULT_CONFIG["level_model"])
+
+    if args.show:
+        print(f"当前模型: {_describe_model(config)}")
+        print(f"  K = {cur['k']:.7f} mm/计数  (1% = {cur['k'] * 160:.3f}mm, "
+              f"16mA = {cur['k'] * 16000:.1f}mm)")
+        print(f"  b = {cur['b']:.2f} mm   (4mA 对应的高度)")
+        print("  4mA  -> raw  4000  -> %6.1f mm" % (cur["b"]))
+        for mm in (50.0, 100.0, 150.0):
+            raw = int(round(4000 + (mm - cur["b"]) / cur["k"]))
+            print("  %-4gmm -> raw %5d  -> %6.2f%%" % (mm, raw, (raw - 4000) / 160.0))
+        print("  20mA -> raw 20000  -> %6.1f mm" % (cur["b"] + cur["k"] * 16000))
+        return
+
+    if args.sample:
+        client = connect_plc(config)
+        try:
+            sw = read_status_word(client, config["slave_id"])
+            valve = read_input_real(client, IREG_VALVE_CMD, config["slave_id"])
+            pump_on = bool(sw & ST_PUMP) or bool(sw & ST_PUMP_CMD)
+            still = (not pump_on) and valve <= 1.0
+            print(f"泵: {'ON' if pump_on else 'OFF'}   阀指令: {valve:.1f}%   "
+                  f"{'静水状态 OK' if still else '⚠️ 不是静水状态'}")
+            if not still and not args.force:
+                sys.exit("Error: 静水两点校准要求泵 OFF 且阀 ≈0 (左侧也不能有自流)。\n"
+                         "  先执行: python3 water_control_cli.py stop\n"
+                         "  (它会关泵+关阀+切手动, 并回读确认液位真的不动了),\n"
+                         "  再人工阻断上方左右桶连通。确认现场确实已无流动后加 --force")
+            raw, spread = _read_raw_settled(client, config, n=5, gap=0.5,
+                                           force=args.force)
+            if raw == 0:
+                sys.exit("Error: PLC 回读的 iLevelRaw = 0, 说明当前程序未映射 "
+                         "qwModbusTCP_Server_Device_9。请在 PLC_PRG 末尾加一行:\n"
+                         "  qwModbusTCP_Server_Device_9 := INT_TO_WORD(iLevelRaw);\n"
+                         "然后重新编译下载。")
+            label = (args.label or "POINT").upper()
+            print(f"raw 中位数 = {raw}   (5 次抖动 {spread:.2f}mm)")
+            print(f"记录: {label} raw={raw}  mm=<尺子读数>")
+            print("三点都记好后(推荐 ~55 / ~100 / ~145mm):")
+            print("  python3 water_control_cli.py calibrate --three-point "
+                  "<raw1> <mm1> <raw2> <mm2> <raw3> <mm3>")
+            print("  三点会给出逐点残差 —— 两点解两未知数残差恒为 0, 检不出量错的点")
+        finally:
+            client.close()
+        return
+
+    if args.two_point:
+        raw1, mm1, raw2, mm2 = args.two_point
+        if raw2 <= raw1 + 1000:
+            sys.exit("Error: 两个点的 raw 相差太小 (<1000 计数), 无法拟合斜率; "
+                     "把两个水位拉开到 60mm 以上")
+        if abs(mm2 - mm1) < 20.0:
+            sys.exit("Error: 两个实测水位相差 <20mm, 无法拟合斜率; "
+                     "建议低点 ~60mm、高点 ~140mm, 让两点把工作区间夹住")
+        if not (4000 <= raw1 <= 20000 and 4000 <= raw2 <= 20000):
+            sys.exit("Error: raw 超出 4-20mA 范围 (4000..20000)")
+        for mm in (mm1, mm2):
+            if not 20.0 <= mm <= 200.0:
+                sys.exit(f"Error: 实测水位 {mm:.1f}mm 不合理 (应在 20-200mm)")
+        k_new = (mm2 - mm1) / (raw2 - raw1)
+        b_new = mm1 - k_new * (raw1 - 4000)
+        ratio = k_new / cur["k"]
+        print(f"现模型: {_describe_model(config)}")
+        print(f"新拟合: K={k_new:.7f} mm/计数 (原 {cur['k']:.7f}, 比值 {ratio:.3f}), "
+              f"b={b_new:.2f} mm")
+        print(f"  跨度检查: raw {int(raw1)}->{int(raw2)} ({int(raw2 - raw1)} 计数), "
+              f"{mm1:.1f}->{mm2:.1f}mm; 端点 4mA={b_new:.1f}mm  "
+              f"20mA={b_new + k_new * 16000:.1f}mm")
+        print("  [!] 两点解两未知数, 残差恒为 0, 拟合优度无法检验。"
+              "有条件请用 --three-point(多一个点才有一个自由度)")
+        if not 0.7 <= ratio <= 1.3 and not args.force:
+            sys.exit(f"Error: 新斜率与原值差 {abs(ratio - 1) * 100:.0f}%, 超过 30% 的"
+                     "自动接受范围。若是首次按静水两点法重建(旧点表本就不可信), "
+                     "加 --force 接受; 否则先核对测量基准/是否量错桶")
+        if not args.yes and not _confirm("写入新的 K 和 b?"):
+            print("已取消, 配置未改动")
+            return
+        _save_model(config, k_new, b_new)
+        print("已写入配置")
+        return
+
+    if args.three_point:
+        v = args.three_point
+        pts = sorted([(v[0], v[1]), (v[2], v[3]), (v[4], v[5])])
+        raws = [r for r, _ in pts]
+        mms = [m for _, m in pts]
+        if len(set(raws)) < 3:
+            sys.exit("Error: 三个 raw 必须互不相同")
+        for r in raws:
+            if not 4000 <= r <= 20000:
+                sys.exit(f"Error: raw {int(r)} 超出 4-20mA 范围 (4000..20000)")
+        for m in mms:
+            if not 20.0 <= m <= 200.0:
+                sys.exit(f"Error: 实测水位 {m:.1f}mm 不合理 (应在 20-200mm)")
+        if raws[-1] - raws[0] < 4000:
+            sys.exit(f"Error: 三点跨度只有 {int(raws[-1] - raws[0])} 计数 (<4000, "
+                     f"约 51mm), 斜率分辨不出来。建议 ~55 / ~100 / ~145mm")
+        if mms[-1] - mms[0] < 50.0:
+            sys.exit(f"Error: 三点实测跨度只有 {mms[-1] - mms[0]:.1f}mm (<50mm)。"
+                     "建议 ~55 / ~100 / ~145mm, 把 50-150mm 工作区间夹住")
+        if mms != sorted(mms):
+            sys.exit("Error: raw 递增而实测 mm 不递增 —— 有点量错了或记串了")
+        # 相邻两点间距不能太悬殊, 否则中间那点几乎不提供约束
+        g1, g2 = raws[1] - raws[0], raws[2] - raws[1]
+        if min(g1, g2) < 0.25 * max(g1, g2):
+            print(f"[!] 三点分布不均 (间距 {g1:.0f} / {g2:.0f} 计数), "
+                  "靠得近的那两点几乎决定不了斜率", file=sys.stderr)
+
+        k_new, b_new, res = _fit_line(pts)
+        if k_new is None:
+            sys.exit("Error: 三点共线于同一 raw, 无法拟合")
+        ratio = k_new / cur["k"]
+        print(f"现模型: {_describe_model(config)}")
+        print(f"三点最小二乘: K={k_new:.7f} mm/计数 (原 {cur['k']:.7f}, 比值 {ratio:.3f}), "
+              f"b={b_new:.2f} mm")
+        print("  逐点残差 (这才是三点的意义 —— 两点时恒为 0, 检不出任何东西):")
+        worst = 0
+        for i, ((r, m), e) in enumerate(zip(pts, res), 1):
+            flag = ""
+            if abs(e) > 1.5:
+                flag = "  <-- 超差"
+            print(f"    P{i}: raw={int(r):5d}  实测 {m:6.2f}mm  拟合 "
+                  f"{k_new * (r - 4000) + b_new:6.2f}mm  残差 {e:+6.2f}mm{flag}")
+            if abs(e) > abs(res[worst]):
+                worst = i - 1
+        rmax = max(abs(e) for e in res)
+        print(f"    最大残差 {rmax:.2f}mm   端点 4mA={b_new:.1f}mm  "
+              f"20mA={b_new + k_new * 16000:.1f}mm")
+        if rmax > 1.5 and not args.force:
+            (wr, wm) = pts[worst]
+            sys.exit(
+                f"Error: 最大残差 {rmax:.2f}mm 超过 1.5mm。三点应当落在一条直线上, "
+                f"超差说明 P{worst + 1}(raw={int(wr)}, 实测 {wm:.2f}mm) 量错了、"
+                "水面没静、或探头在这一段确实非线性。\n"
+                "  静水抖动底是 0.4~0.5mm, 1.5mm 已经是它的 3 倍。"
+                "重量那一点, 或确认无误后加 --force 强行写入")
+        if not 0.7 <= ratio <= 1.3 and not args.force:
+            sys.exit(f"Error: 新斜率与原值差 {abs(ratio - 1) * 100:.0f}%, 超过 30% 的"
+                     "自动接受范围。加 --force 接受, 或先核对测量基准")
+        db = b_new - cur["b"]
+        print(f"  Δb = {db:+.2f}mm   ΔK = {(ratio - 1) * 100:+.1f}%")
+        if abs(db) > 40.0:
+            sys.exit(f"Error: Δb={db:+.2f}mm 超过 40mm 上限。这个量级通常意味着"
+                     "探头还湿着/通气管积水、测量基准变了、或量错了桶")
+        if abs(db) > 25.0 and not args.force:
+            print(f"[!] Δb 达 {db:+.2f}mm, 变化很大; 确认基准没变后加 --force 重试",
+                  file=sys.stderr)
+            sys.exit(2)
+        if not args.yes and not _confirm("写入新的 K 和 b?"):
+            print("已取消, 配置未改动")
+            return
+        _save_model(config, k_new, b_new)
+        print("已写入配置")
+        return
+
+    if args.actual is None:
+        sys.exit("Error: 需要 --actual <实测mm>; 查看当前模型用 --show, "
+                 "只校验不写入用 --check <实测mm>")
+
+    mm_true = args.actual
+    client = connect_plc(config)
+    try:
+        raw, spread = _read_raw_settled(client, config, force=args.force)
+        if not 4000 <= raw <= 20000:
+            sys.exit(f"Error: iLevelRaw={raw} 超出 4-20mA 范围, 先查传感器接线")
+        mm_now = cur["k"] * (raw - 4000) + cur["b"]
+        if not 50.0 <= mm_now <= 150.0:
+            sys.exit(f"Error: 当前显示 {mm_now:.1f}mm 不在 50-150mm 窗口内; "
+                     "请先把水位调到窗口中部 (建议 100mm) 再校准")
+        if not 20.0 <= mm_true <= 200.0:
+            sys.exit(f"Error: 实测值 {mm_true:.1f}mm 不合理 (应在 20-200mm)")
+
+        b_new = mm_true - cur["k"] * (raw - 4000)
+        delta = b_new - cur["b"]
+        print(f"现模型: {_describe_model(config)}")
+        print(f"读数:   iLevelRaw={raw}  (3 次采样抖动 {spread:.2f}mm)")
+        print(f"当前显示 {mm_now:.1f}mm   实测 {mm_true:.1f}mm   "
+              f"→ 误差 {mm_true - mm_now:+.1f}mm")
+        print(f"修正:   Δb = {delta:+.1f}mm   →  b={b_new:.2f}mm (K 不变)")
+        print(f"  端点: 4mA {cur['b']:.1f} → {b_new:.1f}mm,  "
+              f"20mA {cur['b'] + cur['k'] * 16000:.1f} → "
+              f"{b_new + cur['k'] * 16000:.1f}mm")
+        if abs(delta) > 40.0:
+            sys.exit(f"Error: Δb={delta:+.1f}mm 超过 40mm 上限。这个量级通常意味着: "
+                     "探头还湿着/通气管积水、测量基准变了、或量错了桶。请先排查")
+        if args.check:
+            print("(--check: 只报告, 不写入配置)")
+            return
+        if abs(delta) > 25.0 and not args.force:
+            print(f"⚠️ Δb 达 {delta:+.1f}mm, 变化很大; 确认基准没变后加 --force 重试",
+                  file=sys.stderr)
+            sys.exit(2)
+        if not args.yes and not _confirm("写入配置?"):
+            print("已取消, 配置未改动")
+            return
+        _save_model(config, cur["k"], b_new)
+        print(f"已写入: b={b_new:.2f}mm  ({CONFIG_FILE})")
     finally:
         client.close()
 
@@ -514,7 +999,6 @@ def cmd_status(args, config):
         b_pump = bool(sw & ST_PUMP)
 
         lo, hi = _cal_range_mm(config)
-        npts = len(_cal_points(config))
         rkp = read_input_real(client, IREG_KP, config["slave_id"])
         rki = read_input_real(client, IREG_KI, config["slave_id"])
         rkd = read_input_real(client, IREG_KD, config["slave_id"])
@@ -527,7 +1011,16 @@ def cmd_status(args, config):
         print(f"Sensor Fault:  {'YES' if b_fault else 'NO'}")
         print(f"Alarm:         {'YES' if b_alarm else 'NO'}")
         print(f"PID:           Kp={rkp:.3f} Ki={rki:.3f} Kd={rkd:.3f}")
-        print(f"(cal: {npts}-pt interp, range {lo:g}-{hi:g} mm, status word=0x{sw:02X})")
+        try:
+            iraw = read_level_raw(client, config["slave_id"])
+        except Exception:
+            iraw = 0
+        if iraw:
+            print(f"iLevelRaw:     {iraw}  (calibrate with: calibrate --actual <measured mm>)")
+        else:
+            print("iLevelRaw:     n/a  (PLC 程序未映射 Device_9)")
+        print(f"(cal: {_describe_model(config)}, range {lo:g}-{hi:g} mm, "
+              f"status word=0x{sw:02X})")
     finally:
         client.close()
 
@@ -699,6 +1192,39 @@ def main():
     trend_parser.add_argument("--out", type=str, default=None,
                               help="CSV output path (default ./trend_<ts>.csv)")
 
+    # calibrate command (level range calibration: fix slope K, adjust offset b)
+    cal_p = subparsers.add_parser(
+        "calibrate",
+        help="Calibrate level range: fix K, adjust offset b from a measured level")
+    cal_p.add_argument("--actual", type=float, default=None,
+                       help="operator-measured true level in mm (single-point calibration)")
+    cal_p.add_argument("--check", action="store_true",
+                       help="report the error only, do not write config")
+    cal_p.add_argument("--show", action="store_true",
+                       help="show current K/b model and table")
+    cal_p.add_argument("--two-point", type=float, nargs=4, default=None,
+                       metavar=("RAW1", "MM1", "RAW2", "MM2"),
+                       help="refit K and b from two (raw, measured mm) pairs "
+                            "(zero redundancy: residuals are always 0)")
+    cal_p.add_argument("--three-point", type=float, nargs=6, default=None,
+                       metavar=("RAW1", "MM1", "RAW2", "MM2", "RAW3", "MM3"),
+                       help="PREFERRED: refit K and b from three pairs by least "
+                            "squares and report per-point residuals (refuses if "
+                            "any residual exceeds 1.5mm)")
+    cal_p.add_argument("--sample", action="store_true",
+                       help="quiescent sampling for two/three-point calibration "
+                            "(refuses if the pump runs or the valve is open)")
+    cal_p.add_argument("--label", default=None,
+                       help="label printed by --sample (e.g. low / high)")
+    cal_p.add_argument("--yes", action="store_true", help="write without confirmation")
+    cal_p.add_argument("--force", action="store_true",
+                       help="bypass the >3mm jitter, >1.5mm fit-residual, "
+                            ">30%% slope-change and >25mm shift guards")
+
+    # read-level-raw command (calibration: raw 4-20mA counts)
+    subparsers.add_parser("read-level-raw",
+                          help="Read iLevelRaw counts + derived percent/mm (for calibration)")
+
     # read-raw command (debug byte order / address)
     raw_parser = subparsers.add_parser("read-raw", help="Dump raw registers for debugging")
     raw_parser.add_argument("address", type=int, nargs="?", help="Start address (default %%MW0)")
@@ -706,6 +1232,28 @@ def main():
     # auto / manual commands
     subparsers.add_parser("auto", help="Switch to auto mode (control word bit0)")
     subparsers.add_parser("manual", help="Switch to manual mode (control word bit0)")
+
+    # stop / resume: full quiescent state (pump OFF + valve 0% + manual)
+    stop_p = subparsers.add_parser(
+        "stop",
+        help="Quiesce the rig: pump OFF + valve 0%% + manual (block the upper "
+             "link by hand), then verify the level really stops moving")
+    stop_p.add_argument("--settle", type=float, default=5.0,
+                        help="seconds of drift checking after stopping (default 5, 0=skip)")
+    stop_p.add_argument("--samples", type=int, default=5,
+                        help="level samples taken during the drift check (default 5)")
+    stop_p.add_argument("--force", action="store_true",
+                        help="exit 0 even if the rig is not quiescent")
+    resume_p = subparsers.add_parser(
+        "resume",
+        help="Leave the stopped state: preload the integral with u_eq, then switch "
+             "to auto (plain 'auto' would cold-start the integral from 0)")
+    resume_p.add_argument("--valve", type=float, default=None,
+                          help="override the preload opening in percent "
+                               "(default: u_eq reported by the PLC)")
+    resume_p.add_argument("--hold", type=float, default=0.5,
+                          help="seconds to hold manual before switching to auto "
+                               "(default 0.5 = 5 PLC cycles)")
 
     # pump command (manual pump on/off)
     pump_parser = subparsers.add_parser("pump", help="Manual pump on/off (manual mode only)")
@@ -721,7 +1269,9 @@ def main():
     setpid_parser.add_argument("ki", type=float, help="Integral gain")
     setpid_parser.add_argument("kd", type=float, help="Derivative gain")
     subparsers.add_parser("get-pid", help="Read PID gains the PLC is using")
-    subparsers.add_parser("get-learn", help="Read PLC self-learned d0 / u_eq")
+    subparsers.add_parser("get-learn",
+                          help="Read whatever the PLC maps into input regs 0/1 and 6/7 "
+                               "(labelled C / u_eq; only correct for PLC_PRG_simple and _v3)")
 
     # set-ip command
     ip_parser = subparsers.add_parser("set-ip", help="Set PLC IP address")
@@ -755,8 +1305,12 @@ def main():
         "status": cmd_status,
         "trend": cmd_trend,
         "read-raw": cmd_read_raw,
+        "read-level-raw": cmd_read_level_raw,
+        "calibrate": cmd_calibrate,
         "auto": cmd_auto,
         "manual": cmd_manual,
+        "stop": cmd_stop,
+        "resume": cmd_resume,
         "pump": cmd_pump,
         "valve": cmd_valve,
         "set-pid": cmd_set_pid,

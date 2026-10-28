@@ -33,7 +33,6 @@
 │   ├── SKILL.md                 # Skill 说明:命令、Modbus 寄存器映射、整定经验
 │   └── scripts/
 │       ├── water_control_cli.py # 主 CLI:读写水位/PID/标定/手动模式
-│       ├── set_water_level.py   # 一键设定目标水位(mm),PID 匹配 + 斜坡逼近 + 稳定监视
 │       └── step_test.py         # 阀阶跃试验:实测 K/τ/d0,输出 SIMC 推荐 PID 增益
 └── output/                      # 运行输出目录(不入库)
 ```
@@ -71,7 +70,7 @@ python3 water_control_cli.py set-mm 85       # 设定目标水位 85 mm
 python3 water_control_cli.py read-mm         # 读取实测水位(mm)
 python3 water_control_cli.py set-pid 3 0.5 0 # 在线写入 Kp/Ki/Kd(自动使能 bPidTune)
 python3 water_control_cli.py auto|manual     # 自动/手动模式切换
-python3 set_water_level.py 60                # 一键设定 60mm,静默匹配 PID 参数(当前为临时统一增益)
+python3 water_control_cli.py set-mm 60       # 设定 60mm (PLC 内部斜坡限速, 写完即返回)
 ```
 
 常用命令一览(完整说明见 [SKILL.md](skill/water-level-control/SKILL.md)):
