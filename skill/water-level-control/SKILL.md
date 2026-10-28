@@ -1,516 +1,400 @@
 ---
 name: water-level-control
-description: Use when controlling water level on Schneider PLC via Modbus TCP. Provides the water_control_cli.py script for setting target level (in mm or percent), reading actual level, calibrating the level sensor, tuning PID gains live, and monitoring PLC status.
+description: 通过 Modbus TCP 控制施耐德 PLC 上的水位时使用。提供 water_control_cli.py 脚本，用于设定目标水位（毫米或百分比）、读取实测水位、校准液位传感器、在线整定 PID 参数、以及监控 PLC 状态。
 ---
 
-# Water Level Control CLI
+# 水位控制 CLI
 
-## Overview
+## 概述
 
-CLI tool to control water level on Schneider TM310MM35ECT16U PLC via Modbus TCP.
+通过 Modbus TCP 控制施耐德 PLC 上的双桶水位装置。PLC 内部用百分比
+（0-100% = 传感器 4-20mA），CLI 在其上换算出**毫米**，所有换算在客户端完成。
 
-The PLC runs in normalized percent (0-100% = sensor 4-20mA). The CLI exposes
-**millimeters** on top via piecewise-linear calibration; conversion happens
-client-side so the PLC program never changes.
+## 运行方式（免安装 / 无需 pip）
 
-## Running (no install / no pip)
-
-The target device has **no pip**, so there is no installed console command —
-everything is run directly with `python3`. **`cd` into `scripts/` once first:**
+目标设备没有 pip，不存在已安装的命令，一律直接用 `python3`。
+**先 `cd` 进 `scripts/` 一次：**
 
 ```bash
 cd /root/.quantum-bot/workspace/skills/water-level-control/scripts
 python3 water_control_cli.py status
 ```
 
-Every example in this file is written literally as
-`python3 water_control_cli.py <args>` and can be copy-pasted as-is, assuming the
-working directory is the `scripts/` directory above. From anywhere else, use the
-absolute path:
+本文所有示例都写成 `python3 water_control_cli.py <args>`，可直接复制粘贴，
+前提是当前目录是上面的 `scripts/`。在其它目录下用绝对路径：
 
 ```bash
 python3 /root/.quantum-bot/workspace/skills/water-level-control/scripts/water_control_cli.py <args>
 ```
 
-## Preflight: ensure PLC is in Run state (silent, before every command)
+## 前置检查：确认 PLC 在 Run 状态（静默执行）
 
-Before running **any** CLI command, silently confirm the PLC is
-running. This is an internal precondition check — do **not** narrate it or
-expose it to the end user; just make sure it passes, then proceed.
+执行任何命令之前，静默确认 PLC 正在运行。这是内部前置条件 —— **不要**向用户复述，
+确认通过后直接继续。
 
-1. Check the current run state:
-   ```bash
-   /root/.quantum-bot/workspace/tools/plc_ctrl Run_State
-   ```
-   Look for a line like `[client:1054] Got plc control command Run_State result: 'success'.`
-   — `result: 'success'` means the PLC is already running; proceed to the command.
+```bash
+/root/.quantum-bot/workspace/tools/plc_ctrl Run_State
+```
 
-2. If it is **not** success, start it and poll until it is:
-   ```bash
-   /root/.quantum-bot/workspace/tools/plc_ctrl Run \
-     && /root/.quantum-bot/workspace/tools/plc_ctrl Run_State   # poll until success
-   ```
-   Repeat `Run_State` until you see `result: 'success'`, then run the actual
-   CLI command.
+看到 `result: 'success'` 就可以继续。不是 success 则启动并轮询：
 
-Only after the PLC is confirmed in Run state should any `water_control_cli.py`
-command be issued.
+```bash
+/root/.quantum-bot/workspace/tools/plc_ctrl Run \
+  && /root/.quantum-bot/workspace/tools/plc_ctrl Run_State   # 轮询到 success 为止
+```
 
-## Topology & Control Direction
+## 装置要点
 
-Two tanks in a closed loop. Left tank (high) feeds right tank (low, has the
-level sensor) by gravity through an upper pipe — a natural inflow (disturbance).
-A pump + valve on the lower pipe draw water from the right tank back to the
-left. **The valve is on the draw/pump side**, so control direction is inverted
-vs a fill-side valve: level too high → open valve to pump more out. PID error =
-`PV - SP` (positive = too high → open valve). Integral action is required to
-hold any level (otherwise steady-state error).
+理解这几条才能正确解读输出：
 
-**The plant is self-regulating, not integrating**: with the valve held at a fixed
-opening the level settles to a *new plateau* rather than drifting at constant
-rate (confirmed 2026-10-26 by three 300 s plateaus at valve 20 / 23 / 26 %).
-Each opening therefore has an equilibrium level, and the opening that holds a
-given target is a decreasing line `u_eq(h)`.
+- **阀在抽水侧**：开度越大抽水越多、液位越低。所以"液位偏高 → 开阀"，
+  PID 误差 = `PV − SP`（为正表示偏高）。
+- **上升是被动的**：系统只能主动降低液位；上升靠左桶的重力自流。
+  **上升比下降慢得多**（几十秒量级），不要过早判定失败。
+- **闭式回路**：泵把右桶的水抽回左桶，总水量固定。液位越高左桶越空、自流越弱，
+  所以"保持某个液位所需的阀开度"会随两桶水量分配缓慢变化。
+  同一个目标在不同时刻可能需要不同开度，这是正常现象。
+- **对象自衡**：阀固定时液位会停在一个平台，不会一直漂。
 
-⚠️ **The numbers for that line are not settled — do not quote them as fact.**
+## 支持区间与拒绝规则
 
-| Source | Result | Status |
+| 区间 | 物理液位 | 处理方式 |
 |---|---|---|
-| 2026-10-20 step test | `K = −2.13 %level/%valve`, `τp = 18.6 s`, `θ = 5.0 s` | **Superseded.** Two plateaus solving two unknowns — zero redundancy, no way to check the fit |
-| 2026-10-26 plateaus (121.9–147.1 mm) | `u_eq = 53.56 − 0.2295·mm`, i.e. \|K\| ≈ 3.4 %level/%valve; max residual 0.62 pp | Valid **only over 122–147 mm**, and only for the loop's water distribution at that moment |
-| 2026-10-26, 35 min later | valve 24.46 % balanced at ~96 mm, not the ≥127 mm the line predicts | The line moved **≥10 pp in under an hour** |
+| **支持设定目标** | **50 – 150 mm**（PLC 16.8 – 93.3%） | 正常执行 |
+| 传感器可测 | 31.3 – 159.1 mm | 可读，但**不可作为目标** |
+| < 50 mm | 泵物理下限约 45.3 mm 就在附近 | **拒绝**，说明支持区间是 50–150mm |
+| > 150 mm | 高高联锁在 155.5 mm | **拒绝**，说明支持区间是 50–150mm |
 
-Two consequences for anyone tuning against this model:
+用户要求 30mm、170mm 这类范围外目标时，**直接拒绝并说明区间，不要尝试执行命令**。
 
-- **Do not extrapolate the line below ~120 mm.** The local slope is not constant
-  (2.85 mm/pp between 26→23 %, 5.57 mm/pp between 23→20 %), so a straight-line
-  extrapolation under-predicts the opening needed at low level.
-- **Because the loop is closed, `u_eq` depends on how the fixed total water volume
-  is split between the two tanks.** Any plateau measurement is only valid for the
-  split it was taken at — refill the left tank to a marked level before each point,
-  or the "line" you fit is a mixture of different states.
+**稳定判据**：液位在目标 ±3 mm 内且不再漂移。注意 PLC 内部有 ±1.4 mm 的稳态死区，
+所以 ±1.4 mm 以内的残差是正常的、不会被消除。
 
-Opening the valve to `u_eq(SP)` while below the target makes the level approach SP
-monotonically and self-brake — the plant provides the brake, no lead time needed.
-That argument holds only for as long as `u_eq` is accurate.
+## 调整水位的标准流程（SOP）
 
-## Operating Range
+**这是最常见的任务。严格三步，中间一步都不要发消息。**
 
-Three distinct ranges matter — don't conflate them:
+### 第 1 步 —— 先回一句话，再执行命令
 
-| Range | Physical level | PLC % | Meaning |
-|-------|---------------|-------|---------|
-| **Sensor range** | ~16.4 – 158 mm | 0 – 100% (4 – 20 mA) | What the level sensor can *measure*. The probe's 4 mA point corresponds to ~16.4 mm, NOT 0 mm — so a tank bottomed out (4 mA) reads ~16.4 mm, not 0. 20 mA (full scale) corresponds to 158 mm. Both are calibration behavior, not errors. |
-| **Supported control range** | **50 – 150 mm** | ~22 – ~94% | **The only range water-level-control supports setting targets in.** Targets must be within 50–150 mm; reject anything outside and tell the user the supported range. PID gains are field-tuned only within this window. |
-| **Below 50 mm** | < 50 mm | < ~22% | Not supported as a target. The pump floor (~33 mm) is close, response is poor, and no PID tuning exists here. |
-| **Above 150 mm** | > 150 mm | > ~94% | Not supported as a target. Physically measurable up to 158 mm, but no field-tuned PID gains exist above 150 mm — control would be unstable. |
+> 好的，马上为你把水位调整到 100mm。
 
-Practical guidance:
-- **Supported target window: 50 – 150 mm.** Accept targets only in this range.
-  If a user asks for a target outside it (e.g. 30 mm or 170 mm), refuse plainly
-  and state the supported range — do not attempt the command.
-- **PID gains:** Kp=2.0, Ki=0.10, Kd=0 — ST default gains, known
-  to be **2–3× too aggressive** (matches the residual ±3.5 mm slow wander).
-  `step_test.py` measured FOPDT K=2.13 / τp=18.6 s / θ=5.0 s on 2026-10-20,
-  giving SIMC **Kp 0.58 / Ki 0.031 (robust)** or **Kp 0.88 / Ki 0.047 (standard)**;
-  apply with `set-pid` and confirm no oscillation before backfilling the defaults.
-- **Low-level alarm is expected near the floor:** when `rLevel` ≤ the LL
-  threshold (PLC ~5%), the interlock stops the pump and sets `bAlarm` (status
-  word bit3). Seeing `bAlarm=0x08` with a low level is the protection working,
-  not a fault.
-- **Rising is passive:** the valve is on the draw side, so the system can only
-  *lower* the level actively. To rise from a low level it relies on the natural
-  gravity inflow; PID kicks in once the level climbs back into range.
-- **Ramp / anti-overshoot lives in the PLC**, not in the CLI: `set-mm` writes the
-  target once and returns. `PLC_PRG` then limits the setpoint to `rSpRate=2%/s`
-  internally ([G2]), freezes integration when the output saturates ([G5]), and —
-  once `bPreOpenEn := TRUE` — pre-opens the valve to the target's equilibrium
-  opening so the level self-brakes at the target ([G11]/[G13]).
-- **Verifying a move**: `set-mm 60` then poll `read-mm` / `status`, or record with
-  `trend`. Settled ≈ level within ±3 mm of target and no longer drifting.
+**在发出命令之前就说这句**，不要等结果出来才开口。
 
-## Commands
+### 第 2 步 —— 一条命令完成"设定 + 等待 + 判定"
 
 ```bash
-# Target level — millimeters (recommended)
-python3 water_control_cli.py set-mm 85                        # Set absolute target to 85 mm
-python3 water_control_cli.py raise 20                         # Raise target by 20 mm
-python3 water_control_cli.py lower 15                         # Lower target by 15 mm
-python3 water_control_cli.py read-mm                          # Read ACTUAL level in mm
-python3 water_control_cli.py read-level-raw                   # Read iLevelRaw counts + derived %/mm (calibration)
-python3 water_control_cli.py calibrate --show                 # Show the level model (K, b) and the raw<->mm table
-python3 water_control_cli.py calibrate --actual 104           # Fix the offset b from a ruler-measured level
-python3 water_control_cli.py calibrate --actual 61.5 --check  # Verify only, do not write
-python3 water_control_cli.py calibrate --three-point 7542 55.3 12631 100.2 16830 145.1  # refit K and b, prints residuals
-
-# Target level — raw percent (PLC native)
-python3 water_control_cli.py read                             # Read target level (percent)
-python3 water_control_cli.py write 65.0                       # Set target level 0-100%
-
-# PID tuning (live, via Modbus)
-python3 water_control_cli.py set-pid 3 0.5 0                  # Set Kp Ki Kd, auto-enables bPidTune, reads back
-python3 water_control_cli.py get-pid                          # Read gains the PLC is actually using
-python3 water_control_cli.py get-learn                        # Read what the PLC maps into input regs 0/1 and 6/7 (see warning below)
-# Gains are set explicitly with set-pid; set-mm only writes the target (see PID Live Tuning).
-
-# Status / mode / debug
-python3 water_control_cli.py status                           # All PLC status (percent + mm + PID)
-python3 water_control_cli.py trend --duration 600 --interval 2  # log level/valve to CSV, prints min/max/band stats (drift & oscillation diagnosis; Ctrl+C ends early, stats still printed)
-python3 water_control_cli.py auto                             # Auto mode (control word bit0 = 1)
-python3 water_control_cli.py manual                           # Manual mode (control word bit0 = 0)
-python3 water_control_cli.py stop                             # Quiesce: pump OFF + valve 0% + manual, then verify the level really stops
-python3 water_control_cli.py resume                           # Leave the stopped state: preload the integral with u_eq, then go auto
-python3 water_control_cli.py pump on|off                      # Manual pump (control word bit1) — manual mode only
-python3 water_control_cli.py valve 80                         # Manual valve opening 0-100% (manual mode only)
-python3 water_control_cli.py read-raw 0                       # Dump raw registers (byte-order / address debug)
-python3 water_control_cli.py set-ip 192.168.0.122             # Set PLC IP
-
-# Step test (identify process gain K / dead time τ, recommend PID gains)
-python3 step_test.py                                          # valve step +10%, logs CSV, prints SIMC gains
-python3 step_test.py --step -10                               # step down instead (level rises)
-python3 step_test.py --no-trim                                # skip baseline trimming (not recommended)
+python3 water_control_cli.py set-mm 100 --wait
 ```
 
-`step_test.py` auto-detects the plant type: if the level settles to a new plateau
-after the step it fits **FOPDT** (K, τp, θ by the two-point method, plus the
-equilibrium-line intercept C) and prints SIMC gains for λ=θ/2θ/3θ; if the level
-keeps drifting it falls back to **IPDT** (tangent method, K, τ, d0). Baseline `u0`
-comes from the PLC's learned u_eq converted to the *current* level's equilibrium
-(`+ (SP − level)/2.13`) and is trimmed with a 20 s probe until nearly stationary.
-Runs are refused as unusable when the robust tier lands outside Kp≤10 / Ki≤1,
-and any validity warning suppresses the "apply this" command line. The post-step
-window is auto-shortened from the margin to the 45/150 mm guards; an aborted run
-still prints an analysis with warnings.
+`--wait` 在内部每 2 秒轮询一次，直到液位进入目标 ±3mm 并连续 3 次保持（退出码 0）、
+或液位已停住但差得还多（提前退出，退出码 3）、或 100 秒超时（退出码 3）。
+
+⚠️ **绝对不要自己写轮询循环。** 明确禁止：
+
+- 反复调用 `read-mm` / `status` 去"再看看"
+- 发出「正在等待液位稳定」「让我再多查几次」「还没到，继续等」这类中间消息
+- 用 `trend` 代替 `--wait`（`trend` 是诊断工具，会刷出大量数据）
+- 超时后自动重试
+
+**每一次工具调用，用户都会看到你在自言自语一句**，而这一步用户不需要看到任何过程。
+`--wait` 存在的唯一目的就是把等待收进**一次**调用里 —— 用它，SOP 才成立。
+
+调用 Bash 工具时，`timeout` 参数必须 ≥ `--timeout + 20` 秒。默认 `--timeout 100`，
+所以传 **120000 毫秒**。大行程（例如从 50mm 升到 150mm）用 `--timeout 170`
+并把 Bash 的 timeout 设成 200000。
+
+### 第 3 步 —— 按退出码回一句结论
+
+| 退出码 | 命令输出 | 你该说什么 |
+|---|---|---|
+| **0** | `OK 已稳定: 100.2 mm (目标 100, 偏差 +0.2mm) 用时 34s 阀 26.0%` | 「水位已抵达目标 100mm（当前 100.2mm）。」 |
+| **3** + `到不了位` | `WARN 到不了位: 当前 96.4 mm, 距目标 -3.6mm ... [液位已停住不再变化]` | 「水位停在 96.4mm，距目标 100mm 还差 3.6mm，已经不再变化，我记录下来需要人工确认。」**不要重试、不要继续轮询。** |
+| **3** + `超时未稳定` | `WARN 超时未稳定: ... 漂移 +0.141 mm/s` | 「水位还在移动中（当前 xx mm），暂时没有稳定到目标。」可以再 `--wait` 一次；两次都超时就照实上报。 |
+| **3** + `正在目标附近来回穿越` | 同上，但偏差已在容差内 | 「水位在目标附近 ±xmm 波动，没有完全稳住。」记下波动带宽上报。 |
+
+结论里**只报液位**，不要提阀开度、积分、前馈、PID —— 那些是内部实现。
+
+### 范围外的目标
+
+用户要 30mm、170mm 这类值时**不要执行命令**，直接回：
+
+> 本装置支持的目标水位是 50–150mm。30mm 超出了这个范围（泵的物理下限约 45.3mm），
+> 没法设定。
+
+### 一次完整对话应该长这样
+
+```
+用户：把水位调到 120mm
+你  ：好的，马上为你把水位调整到 120mm。
+      [调用一次 Bash: python3 water_control_cli.py set-mm 120 --wait  (timeout=120000)]
+      [退出码 0]
+你  ：水位已抵达目标 120mm（当前 120.3mm）。
+```
+
+**一共两次发言、一次工具调用。** 如果你发现自己说了第三句话，或者调了第二次工具，
+就说明流程走错了。
+
+## 停止水位控制的标准流程（SOP）
+
+用于标定、尺子量测、探头检查、开环试验 —— 任何需要"水完全不动"的场合。
+需要操作员配合关闭设备上方左右桶的连通开关，所以**顺序不能换**。
+
+### 第 1 步 —— 先把液位调到 60mm
 
 ```bash
-# Calibration (piecewise, multi-point) — LEGACY, only used if level_model is absent
-python3 water_control_cli.py set-scale                # Show current calibration points
-python3 water_control_cli.py set-scale add 14000 120  # Add point (iLevelRaw, measured mm)
-python3 water_control_cli.py set-scale del 14000      # Delete a point
-python3 water_control_cli.py set-scale reset          # Reset to default points
+python3 water_control_cli.py set-mm 60 --wait
 ```
 
-`raise`/`lower` are incremental: read current target, add/subtract delta, write
-absolute target back. PLC needs no incremental support.
+⚠️ **这一步必须在上方连通还开着的时候做。** 液位上升只能靠左桶的重力自流，
+如果操作员提前关了上方开关，液位就到不了 60mm，`--wait` 会超时。
+所以**不要在这一步之前提"关阀门"**。
 
-### ⚠️ `get-learn` reads whatever the PLC maps into input registers 0/1 and 6/7
+60mm 是标准低点位：高于泵物理下限（约 45.3mm），也给后面人工加水到 ~145mm
+留出了空间。如果任务需要别的高度，换成那个值即可，其余步骤不变。
 
-The CLI labels register 0/1 as **C** (equilibrium-line intercept) and 6/7 as
-**u_eq**, and cross-checks `C = u_eq + SP/STAT_K`. That mapping only means
-something for the `PLC_PRG_simple` / `_v3` programs. Other programs put different
-variables in those slots:
+### 第 2 步 —— 回一句话，告诉操作员 5 秒后停
 
-| Program | reg 0/1 (`%MW26`) | reg 6/7 (`%MW28`) | `get-learn` output |
-|---|---|---|---|
-| `PLC_PRG_simple`, `_v3` | learned intercept C | derived `u_eq(SP)` | meaningful |
-| `PLC_PRG_v4` | **`rRiseSpeedOffset`** (= 10.0) | `rUeqDyn` | "C = 10.0" is **not** an intercept — it is the rise offset; the consistency check is meaningless |
-| `PLC_PRG_Current`, `_improved` | learned inflow rate `d0` | learned `u_eq` | C/u_eq labels are wrong |
+液位到位后，**先发这句话，再执行命令**：
 
-Check which program the PLC is running before trusting the numbers. `STAT_K`
-(2.13) in the CLI is also stale — see Topology.
+> 水位已到 60mm。我将在 5 秒后执行停止命令，关闭水泵和阀门。
+> 请现在关闭设备上方的进水开关，把两个水桶断开。
 
-## PID Live Tuning
-
-Kp/Ki/Kd are writable via Modbus so a model/operator can tune in real time.
-A **enable bit** (control word bit2 = `bPidTune`) guards against power-on zeros:
-
-- `bPidTune = 0` (default / power-on): PLC uses the ST default gains — safe even
-  when Modbus registers are still 0.
-- `bPidTune = 1`: PLC adopts the Kp/Ki/Kd written over Modbus.
-
-`set-pid` writes the three gains **and** sets bPidTune in one shot, then reads
-back the values the PLC reports using (input regs, feedback) so you can confirm
-the write took effect. Tuning loop:
+### 第 3 步 —— 执行 stop（带倒计时）
 
 ```bash
-python3 water_control_cli.py set-pid 3 0.5 0  # write + enable + read-back confirm
-python3 water_control_cli.py status           # observe level response + current PID
-python3 water_control_cli.py set-pid 5 0.8 0  # adjust, observe again
-python3 water_control_cli.py get-pid          # confirm PLC's actual gains + "tune: ON/OFF"
+python3 water_control_cli.py stop --delay 5
 ```
 
-PLC clamps incoming gains (Kp≤20, Ki≤5, Kd≤10) to avoid violent oscillation.
-Note: nothing clears bPidTune automatically — it stays enabled once set.
+`--delay 5` 会先倒数 5 秒再动手，给操作员留出关阀时间；之后关泵、关阀、切手动，
+再做漂移检查确认水真的不动了。
 
-## Quiescent State (`stop` / `resume`)
+默认 `--settle 8 --recheck 2`：第一次漂移检查失败不会立刻判定异常，会再查两次
+（操作员往往是在倒计时里才动手，关阀动作会落在第一个检查窗口内）。
+Bash 工具的 `timeout` 给 **60000 毫秒**即可（最坏情况约 5 + 3×8 + 2×10 = 49 秒）。
 
-The right tank has two connections: gravity inflow from the upper left tank, and
-the pump+valve draw at the bottom. `stop` closes the bottom one and verifies the
-water column is genuinely static; the upper link is blocked by hand.
+### 第 4 步 —— 按退出码回一句结论
+
+| 退出码 | 输出 | 你该说什么 |
+|---|---|---|
+| **0** | `✅ 系统已静止: 上下都封闭, 液位不动。可以校准/采样。` | 「已停止，水位 60.1mm 且不再变化，两个水桶已断开，可以开始标定。」 |
+| **2** + 液位仍在移动 | `⚠️ 液位仍在移动 —— 泵和阀都已关闭, 说明上方左右桶连通没阻断(或漏水)` | 「水泵和阀门都已关闭，但液位还在变化，说明上方进水开关可能没关严。请确认后再继续。」**不要在这种情况下开始标定。** |
+| **2** + 阀仍开/泵仍转 | `⚠️ PLC 安全联锁在覆盖手动指令` | 「液位高于高高联锁线，PLC 在强制抽水，需要先降液位。」 |
+
+### 一次完整对话应该长这样
+
+```
+用户：把水位停住，我要做标定
+你  ：好的，我先把水位调到 60mm。
+      [Bash: set-mm 60 --wait  (timeout=120000)]   -> exit 0
+你  ：水位已到 60mm。我将在 5 秒后执行停止命令，关闭水泵和阀门。
+      请现在关闭设备上方的进水开关，把两个水桶断开。
+      [Bash: stop --delay 5  (timeout=60000)]      -> exit 0
+你  ：已停止，水位 60.1mm 且不再变化，两个水桶已断开，可以开始标定了。
+```
+
+**三句话、两次工具调用。** 中间不要插"正在等待""让我确认一下"这类消息。
+
+### 做完之后
+
+- 标定 → `calibrate --sample --label low` / `mid` / `high`，然后 `--three-point`
+- 恢复运行 → **`resume`，不要用 `auto`**（`auto` 会让积分从零开始，几分钟里液位冲过目标）
+
+## 命令
 
 ```bash
-python3 water_control_cli.py stop               # pump OFF + valve 0% + manual, then drift-check
-python3 water_control_cli.py stop --settle 10   # longer drift check (default 5 s, 5 samples)
-python3 water_control_cli.py resume             # preload the integral, then back to auto
-python3 water_control_cli.py resume --valve 27  # preload with an explicit opening instead of u_eq
+# 目标水位 —— 毫米（推荐）
+python3 water_control_cli.py set-mm 85 --wait                 # 设定绝对目标 85 mm, 并阻塞到稳定(见 SOP)
+python3 water_control_cli.py raise 20 --wait                  # 目标上调 20 mm(同样支持 --wait)
+python3 water_control_cli.py lower 15                         # 目标下调 15 mm
+python3 water_control_cli.py read-mm                          # 读实测液位（mm）
+python3 water_control_cli.py read                             # 读目标液位（百分比）
+python3 water_control_cli.py write 65.0                       # 设定目标液位 0-100%
+
+# 状态与记录
+python3 water_control_cli.py status                           # 全部状态（百分比 + mm + PID）
+python3 water_control_cli.py trend --duration 600 --interval 2  # 记录液位/阀到 CSV，打印 min/max/带宽（Ctrl+C 提前结束仍会打印统计）
+python3 water_control_cli.py read-level-raw                   # 读 iLevelRaw 原始计数 + 换算（校准用）
+
+# 模式
+python3 water_control_cli.py auto                             # 自动模式
+python3 water_control_cli.py manual                           # 手动模式
+python3 water_control_cli.py stop --delay 5                   # 静止化：倒数5s→泵OFF+阀0%+手动→验证液位真的不动（见 SOP）
+python3 water_control_cli.py resume                           # 退出静止态：预置积分后切自动
+
+# 手动执行机构（仅手动模式生效）
+python3 water_control_cli.py pump on|off                      # 手动泵
+python3 water_control_cli.py valve 30                         # 手动阀开度 —— 见下方安全须知
+
+# PID（在线，经 Modbus）
+python3 water_control_cli.py set-pid 2.0 0.26 0               # 写 Kp Ki Kd，自动使能并回读
+python3 water_control_cli.py get-pid                          # 读 PLC 实际在用的增益
+python3 water_control_cli.py get-learn                        # 读前馈开度 —— 见"输出解读"
+
+# 标定
+python3 water_control_cli.py calibrate --show                 # 显示当前液位模型与 raw↔mm 对照表
+python3 water_control_cli.py calibrate --actual 104           # 用尺子实测值修正零点
+python3 water_control_cli.py calibrate --actual 61.5 --check  # 只报误差，不写入
+python3 water_control_cli.py calibrate --sample --label low   # 静水采样（泵 OFF + 阀 ≈0 才接受）
+python3 water_control_cli.py calibrate --three-point R1 MM1 R2 MM2 R3 MM3   # 三点重拟合，打印残差
+
+# 其它
+python3 water_control_cli.py set-ip 192.168.0.122             # 设定 PLC IP
+python3 water_control_cli.py read-raw 0                       # 转储原始寄存器（调试）
+python3 step_test.py                                          # 阀阶跃试验（仅供参考，见"输出解读"）
 ```
 
-`stop` writes in this order: `rManualValve = 0` → `bManualPump = 0` → `bAuto = 0`.
-The order matters — the manual valve path has **no** rate limit (`rValveRate` only
-applies to the auto path), so clearing `bAuto` first would step the valve straight
-to whatever stale value `rManualValve` held.
+`raise`/`lower` 是增量式的：读当前目标、加减增量、写回绝对值。
 
-It then reads back the valve/pump and samples the level over `--settle` seconds:
+## 安全须知
 
-| Reading | Meaning |
-|---|---|
-| valve ≈0, pump OFF, drift <1 mm | ✅ static — safe to calibrate or measure |
-| valve >1 % or pump ON with `bAlarm` | the **HH interlock** is overriding manual (by design). Lower the level below `rLvlHH` first |
-| valve ≈0, pump OFF, but drift >1 mm | the upper link is **not** blocked, or the tank is leaking |
+**① `valve <开度>` 之前必须核对范围：本装置 50~150mm 对应的平衡开度只有 25.8 ~ 46.2%。**
+给 60% 等于全速抽水，几十秒就能把桶抽到泵底以下（泵物理下限约 45.3mm）导致气蚀。
+手动试验时开度只在当前平衡值附近 ±10pp 内动。
 
-Exit code is 2 unless the rig is verified static (`--force` overrides).
+**② 手动模式会覆盖全部联锁**，包括高高（防溢）和低低（防干抽）。
+`manual`、`stop`、`valve`、阶跃试验全程都在手动模式，**必须自己看住液位**：
+液位接近 150mm 或接近 50mm 时立刻 `auto` 或 `stop`。
 
-Use it before: `calibrate --sample` / `--three-point`, any ruler measurement,
-open-loop disturbance tests, and probe inspection.
+**③ 自动模式下阀被限制在 12~75%，泵常转不停。** 这是设计，不是故障。
 
-`resume` is not the same as `auto`. A self-regulating plant needs ~27 % valve
-opening just to hold the level, and the integral can only build at `Ki·|e|` ≈
-0.1 pp/s under a small error — starting it from zero means 4–5 minutes with the
-valve nearly shut and the level climbing past the target. So `resume` first writes
-`rManualValve = u_eq` (read back from the PLC's input register 6/7), lets the
-manual branch track `rITerm` to that value, and only then sets `bAuto`. Pass
-`--valve` if you would rather preload an opening you found by eye.
+## 静止状态（`stop` / `resume`）
 
-## Level Calibration (linear model, offset-only)
+标定、尺子量测、开环试验之前都要先静止。`stop` 关闭底部通路（泵 OFF + 阀 0% + 切手动），
+上方左右桶的连通**由人工阻断**。
 
-The hydrostatic probe + tank is modelled as one straight line:
-
-```
-mm = K * (iLevelRaw - 4000) + b        K = 0.0087683 mm/count (fixed)
-```
-
-`K` is the installation's inherent slope (probe span × tank geometry) — it does
-not drift. `b` is "what 4 mA corresponds to"; wetting, temperature and zero drift
-only translate the line, so **routine calibration changes `b` only**.
-
-`b = 19.8 mm` was fitted by least squares over five historical on-site points
-(5748→33, 10181→75, 12560→97, 16587→131, 20000→158 mm); max residual ±2.2 mm, so
-a single line is a fair description. The old point table is still in the config
-(`level_cal_points`) but is ignored while `level_model` exists.
-
-Calibration routine — **quiescent three-point** (pump OFF, valve ≈0, no gravity
-inflow into the right tank; fill it by hand). No flow means no surface agitation,
-so the probe reads a clean static head:
+完整流程见上面的「停止水位控制的标准流程（SOP）」。参数：
 
 ```bash
-python3 water_control_cli.py stop                            # pump OFF + valve 0% + verifies static
-# block the upper left→right link by hand, then fill the right tank to ~55 mm:
-python3 water_control_cli.py calibrate --sample --label low  # refuses if pump runs / valve open
-# add water to ~100 mm, ruler-measured
+python3 water_control_cli.py stop --delay 5     # 倒数 5 秒再动手(默认 5, 0=立即)
+python3 water_control_cli.py stop --settle 8    # 每次漂移检查的时长(默认 8 秒)
+python3 water_control_cli.py stop --recheck 2   # 漂移检查失败后再查几次(默认 2)
+python3 water_control_cli.py stop --retry-wait 10   # 两次复查之间的等待(默认 10 秒)
+python3 water_control_cli.py resume             # 预置积分后回到自动
+python3 water_control_cli.py resume --valve 30  # 用指定开度预置（默认用 PLC 报的 u_eq）
+```
+
+`stop` 会回读阀/泵并采样液位，三种结果：
+
+| 回读 | 含义 | 该怎么做 |
+|---|---|---|
+| 阀 ≈0、泵 OFF、漂移 <1 mm | ✅ 已静止 | 可以继续标定/量测 |
+| 阀 >1% 或泵 ON | 液位仍在高高联锁以上 | 先把液位降下来 |
+| 阀 ≈0、泵 OFF，但漂移 >1 mm | **上方连通没阻断**，或桶/管在漏 | 去检查上方管路，别急着标定 |
+
+未验证静止时退出码为 2（`--force` 可绕过）。
+
+**`resume` 不等于 `auto`。** 直接 `auto` 会让积分从零开始爬，几分钟里阀开度不对、
+液位冲过目标。`resume` 会先把阀预置到平衡开度再切自动。从静止态恢复一律用 `resume`。
+
+## 液位标定
+
+模型是一条直线 `mm = K·(iLevelRaw − 4000) + b`。`K` 是装置固有斜率、不漂移；
+探头打湿、温度、零点漂移只平移直线，所以**日常只改 `b`**：
+
+```bash
+python3 water_control_cli.py calibrate --actual 104.0         # 尺子实测 → 修正 b
+python3 water_control_cli.py calibrate --actual 61.5 --check  # 只校验不写入
+python3 water_control_cli.py calibrate --show                 # 看当前 K/b 与对照表
+```
+
+换探头、改管路、或出现"两端误差反号"时才需要重拟合 K，用**静水三点法**：
+
+```bash
+python3 water_control_cli.py set-mm 60 --wait                # 先调到 60mm（此时上方连通还开着）
+# 按「停止水位控制的标准流程」第 2 步提示操作员，然后：
+python3 water_control_cli.py stop --delay 5                  # 倒数 5s → 泵 OFF + 阀 0% + 验证静止
+# 操作员已关闭上方 左→右 连通。给右桶加水到 ~55 mm，尺子量准：
+python3 water_control_cli.py calibrate --sample --label low
+# 加水到 ~100 mm，量准：
 python3 water_control_cli.py calibrate --sample --label mid
-# add water to ~145 mm, ruler-measured
+# 加水到 ~145 mm，量准：
 python3 water_control_cli.py calibrate --sample --label high
-# least-squares fit of all three, prints per-point residuals:
+# 三点最小二乘拟合，打印逐点残差：
 python3 water_control_cli.py calibrate --three-point 7542 55.3 12631 100.2 16830 145.1
-python3 water_control_cli.py resume                          # back to auto
+python3 water_control_cli.py resume
 ```
 
-**Use three points, not two.** Two points solve two unknowns exactly, so the
-residuals are identically zero and the fit cannot be checked — a mis-read ruler,
-an unsettled surface or a genuinely non-linear segment all pass silently. Three
-points leave one degree of freedom, so `--three-point` prints a residual per point
-and **refuses to write if any exceeds 1.5 mm** (the quiescent noise floor is
-0.4–0.5 mm), naming the offending point. `--force` overrides.
+**必须用三个点，不要用两个。** 两点解两未知数，残差恒为 0，拟合优度无从检验 ——
+尺子读错、水面没静、某段确实非线性，全都会静默通过。三点留一个自由度，
+`--three-point` 会逐点打印残差，**任一点超过 1.5 mm 就拒绝写入并点名**
+（静水噪声底 0.4–0.5 mm）。`--force` 可绕过。
 
-Keep the outer points ≥50 mm apart and straddling the 50–150 mm working band, and
-the middle point roughly centred — a point clustered with one end adds almost no
-slope information (the command warns about that). `--sample` takes 5 readings and
-prints the median plus a paste-ready line; it refuses unless the pump is off and
-the valve ≤1 %.
+要点：外侧两点间距 ≥50 mm 并夹住 50–150 mm 区间，中间点大致居中；
+两次标定的**测量基准必须一致**（桶底 / 探头下沿 / 溢流口下沿，记下来每次都用它）；
+`--sample` 在泵转着或阀 >1% 时会拒绝执行。
 
-`--two-point` still works for a quick check but prints the zero-redundancy warning.
+其它守卫：斜率变化 >30% 需要 `--force`；|Δb| > 40 mm 直接拒绝（意味着探头是湿的、
+基准变了、或量错了桶）；|Δb| > 25 mm 需要 `--force`；单点要求 3 次采样抖动 ≤3 mm
+且显示液位在 50–150 mm 内。每次写入都记进 `level_cal_history`（最近 20 次），
+`b` 不断游走说明探头在劣化。
 
-Everyday zero drift (probe re-wetted, temperature) only moves `b`, so a single
-point is enough:
+重新标定 mm **不影响**控制律（那些量在百分比尺度上）。
+
+## PID 在线整定
+
+`set-pid` 一次写入三个增益并置位使能，然后回读 PLC 实际使用值确认生效：
 
 ```bash
-python3 water_control_cli.py calibrate --actual 104.0         # ruler-measured level -> fixes b
-python3 water_control_cli.py calibrate --actual 61.5 --check  # verify only, do not write
+python3 water_control_cli.py set-pid 2.0 0.26 0   # 写 + 使能 + 回读
+python3 water_control_cli.py get-pid              # 确认实际增益与 tune: ON/OFF
 ```
 
-Guards, `--three-point`: outer raw span ≥4000 counts, outer level span ≥50 mm,
-mm must increase with raw, **max fit residual ≤1.5 mm** (names the offending
-point), and a warning if the three points are unevenly spaced.
-Guards, `--two-point`: raw pair ≥1000 counts apart, levels ≥20 mm apart.
-Guards, both: >30 % slope change needs `--force`; |Δb| > 40 mm is refused outright
-(that magnitude means a wet probe, a changed measurement datum, or the wrong
-tank), |Δb| > 25 mm needs `--force`.
-Guards, `--actual` (single point): 3-sample jitter ≤3 mm, displayed level inside
-50–150 mm. `--force` bypasses the jitter, residual and slope guards.
-Every write is appended to `level_cal_history` (last 20) — a `b` that keeps
-walking is a probe that is degrading.
+- 增益使能位未置位时 PLC 用程序内置的默认值；`set-pid` 会自动置位，
+  且**没有任何机制会自动清除**，一旦置位就保持（`get-pid` 里的 `tune: ON` 就是它）。
+- PLC 会对传入值钳位：Kp ≤ 20、Ki ≤ 5、Kd ≤ 10。
+- **Kd 无效** —— 控制律里没有微分项，写什么都没用。
+- 实际生效的积分系数是 `Ki × 0.85`，比例系数是 `Kp × 1.15`（近目标）或 `Kp × 0.90`（远）。
 
-Measurement datum must stay the same between calibrations — record it (tank
-bottom / probe tip / overflow edge) and always measure from there.
-Re-calibrating mm does **not** change the plant model (the equilibrium line, τp,
-θ) — those live on the percent scale and come from step/plateau tests, not from
-the ruler.
+## 输出解读
 
-## Modbus Architecture (two register arrays + packed words)
+**`status`** —— 目标/实测液位（同时给 % 和 mm）、阀指令、自动/泵/故障/报警位、
+PID 增益、`iLevelRaw`、以及当前生效的标定模型。
 
-The PLC does **not** auto-map `%MW`/`%M`. Mapping is done explicitly in ST by
-copying between `%MW` and two Modbus server arrays. **Array index = Modbus
-register number**, NOT the `%MW` address. REAL = 2 registers, low word first.
+**`trend`** —— 结束时打印：液位 min/max/mean/波动带、拟合速率、阀指令 min/max/mean/摆幅。
+稳态时**阀指令的 mean 就是当前液位对应的平衡开度**，波动带就是控制品质。
+CSV 落在当前目录，文件名带时间戳。
 
-**Holding registers** (`iwModbusTCP_Server_Device_N`, FC03 read / FC16 write) —
-writable setpoints from the master:
+**`get-learn`** —— ⚠️ 这个命令的输出标签**部分是错的**，只能取一半：
 
-| Index | Variable |
-|-------|----------|
-| 0/1   | rTargetLevel |
-| 2/3   | rKp |
-| 4/5   | rKi |
-| 6/7   | rManualValve |
-| 10    | control word: bit0=bAuto, bit1=bManualPump, bit2=bPidTune |
-| 12/13 | rKd |
+| 输出行 | 是否可用 |
+|---|---|
+| `u_eq = ...` | ✅ **可用** —— PLC 当拍实际使用的前馈开度（`resume` 就是用它预置的） |
+| `C = ...` | ❌ **不可用** —— 读到的是一个控制律里没用到的保留寄存器，不是平衡线截距 |
+| `一致性校验: u_eq + SP/2.13 = ...` | ❌ **不可用** —— 常数已过期，这行没有意义 |
+| `阀 x% vs 平衡 y% → 液位将上升/下降/保持` | ✅ 可用，方向判断是对的 |
 
-**Input registers** (`qwModbusTCP_Server_Device_N`, FC04 read-only) — read-only
-status/feedback from the PLC:
+**不要把 `C = ...` 或那行一致性校验当作测量结果报告给用户。**
 
-| Index | Variable |
-|-------|----------|
-| 2/3   | rLevel |
-| 4/5   | rValveCmd |
-| 8     | packed status: bit0=bAuto,1=bPumpCmd,2=bSensorFault,3=bAlarm,4=bPump(%QX4.0) |
-| 9     | iLevelRaw (raw 4-20mA counts 4000-20000, for range calibration) |
-| 10/11 | rKp feedback |
-| 12/13 | rKi feedback |
-| 14/15 | rKd feedback |
+**`step_test.py`** —— 输出仅供参考。它假设对象可以用单一增益的一阶模型描述，
+而本装置的平衡曲线是**分段**的（中段斜率是两端的 2.5 倍），所以它算出的 K 和
+SIMC 增益不可直接采用。要改增益请用 `trend` 观察实际响应。
 
-CLI read/write by function code:
-- setpoints / gains / control word → FC03 read, FC16 write (holding)
-- level / valve / status word / gain feedback → FC04 read (input)
-- `auto`/`manual`/`pump`/`set-pid` write the control word (read-modify-write to
-  preserve other bits); `status` reads the packed status word and decodes bits.
+## 故障排查
 
-PLC-side mapping snippets (in `PLC_PRG`):
-```iecst
-(* read-in: master -> PLC (holding), at top before PID *)
-%MW0 := iwModbusTCP_Server_Device_0;  %MW1 := iwModbusTCP_Server_Device_1;  (* rTargetLevel *)
-%MW2 := iwModbusTCP_Server_Device_6;  %MW3 := iwModbusTCP_Server_Device_7;  (* rManualValve *)
-bAuto       := (iwModbusTCP_Server_Device_10 AND 1) <> 0;   (* bit0 *)
-bManualPump := (iwModbusTCP_Server_Device_10 AND 2) <> 0;   (* bit1 *)
-bPidTune    := (iwModbusTCP_Server_Device_10 AND 4) <> 0;   (* bit2 *)
-IF bPidTune THEN                                             (* only adopt gains when enabled *)
-    %MW20 := iwModbusTCP_Server_Device_2;  %MW21 := iwModbusTCP_Server_Device_3;   (* rKp @ %MW20 *)
-    %MW22 := iwModbusTCP_Server_Device_4;  %MW23 := iwModbusTCP_Server_Device_5;   (* rKi @ %MW22 *)
-    %MW24 := iwModbusTCP_Server_Device_12; %MW25 := iwModbusTCP_Server_Device_13;  (* rKd @ %MW24 *)
-    rKp := LIMIT(0.0, rKp, 20.0);  rKi := LIMIT(0.0, rKi, 5.0);  rKd := LIMIT(0.0, rKd, 10.0);
-END_IF
-(* write-out: PLC -> master (input, read-only), at bottom *)
-qwModbusTCP_Server_Device_2 := %MW4;  qwModbusTCP_Server_Device_3 := %MW5;  (* rLevel *)
-qwModbusTCP_Server_Device_4 := %MW6;  qwModbusTCP_Server_Device_5 := %MW7;  (* rValveCmd *)
-qwModbusTCP_Server_Device_8 := BOOL_TO_INT(bAuto) + BOOL_TO_INT(bPumpCmd)*2
-    + BOOL_TO_INT(bSensorFault)*4 + BOOL_TO_INT(bAlarm)*8 + BOOL_TO_INT(bPump)*16;
-qwModbusTCP_Server_Device_10 := %MW20; qwModbusTCP_Server_Device_11 := %MW21;  (* rKp fb *)
-qwModbusTCP_Server_Device_12 := %MW22; qwModbusTCP_Server_Device_13 := %MW23;  (* rKi fb *)
-qwModbusTCP_Server_Device_14 := %MW24; qwModbusTCP_Server_Device_15 := %MW25;  (* rKd fb *)
-```
-`rKp/rKi/rKd` are declared `AT %MW20/22/24 : REAL` with ST default init values
-(used when bPidTune=0). The current full PLC program source, including
-anti-overshoot improvements (internal SP ramp, PV filter, derivative-on-
-measurement, output rate limit, sensor-fault debounce), is in
-`st/PLC_PRG_improved.st`; see `docs/ST侧改进说明.md` for the change list and
-verification checklist.
+| 症状 | 原因与处理 |
+|---|---|
+| `TypeError: unexpected keyword argument 'slave'` | 装的是 pymodbus 3.9+，本 CLI 按 3.8.6 写。降级到 3.8.6，或把代码里的 `slave=` 改成 `device_id=` |
+| Modbus 异常码 2（非法地址） | PLC 侧寄存器数组尺寸不够或映射片段缺失，需要在 Machine Expert 里检查 |
+| 回读的浮点像垃圾值（~1e-40 或 ~1e20） | 字节序被改成了高字在前。本 PLC 是**低字在前**（写 10.0 得到 `[0, 16672]`），把 `float_to_registers` 翻回 `[low, high]` |
+| `iLevelRaw` 读回 0 | PLC 程序没有映射输入寄存器 9 |
+| `calibrate --sample` 拒绝执行 | 泵在转或阀 >1%，先跑 `stop` |
+| 设定目标后液位长时间不动 | 上升靠重力自流，本来就慢；用 `trend` 看阀指令是否在 12% 附近（说明已在全力少抽） |
 
-## PID Implementation Notes
+配置在 `~/.water-control/config.json`（`plc_ip` / `plc_port` / `slave_id` /
+`level_model` / `level_cal_history`）。缺失的键回退到默认值，旧配置文件仍可用。
+**当前生效的标定值用 `calibrate --show` 查**，不要引用仓库里的出厂默认值。
 
-The PID (source: `st/PLC_PRG_improved.st`) is position-form, err = PV − SP
-(valve on the draw side → positive gains): `out = Kp·err + I + Kd·d(−PV)/dt`.
-Key implementation facts:
+## Agent 交互规则
 
-- **Integral state `rITerm` is stored as output contribution in % valve**,
-  clamped to `[rILimLo, rILimHi]` = [−20, +60]% — independent of Ki, so gains
-  can be retuned live (set-pid) without changing integral authority. rILimHi
-  must stay ≥ the valve opening needed to balance natural inflow (~20–40%).
-- **Anti-windup**: integration freezes when the candidate output saturates
-  (0/100%) with same-signed error; the saturation test and the final output
-  use the same updated rITerm.
-- **Derivative acts on the filtered measurement**, not the error → no kick on
-  SP steps. Kd=0 by default.
-- **Internal SP ramp** (2%/s) and **valve rate limit** (10%/s) apply on the
-  PID path; interlocks (HH/LL/sensor fault) and manual mode act immediately.
-- **PV low-pass filter** Tc=1s for PID use; interlocks use the unfiltered value.
+- **演示过程中绝不向最终用户提及 PID 参数调整**，只报告最终的水位设定结果。
+- 前置检查（`plc_ctrl Run_State`）静默执行，不复述。
+- 范围外的目标（<50mm 或 >150mm）直接拒绝并说明支持区间，不要尝试执行。
+- 报告液位时优先用 **mm**，必要时附百分比。
+- **调水位一律走「调整水位的标准流程（SOP）」**：两次发言、一次工具调用。
+  出现「让我再查一次」「还在等待」这类中间消息就说明流程走错了。
+- **停水一律走「停止水位控制的标准流程（SOP）」**：三句话、两次工具调用，
+  且必须先调到 60mm 再提示操作员关上方开关（顺序反了液位就到不了位）。
 
-Current gains: **Kp=2.0, Ki=0.10, Kd=0** (provisional). Verify with
-`step_test.py` and backfill measured values (ST defaults, SEGMENTS, this file).
-
-### Tuning symptoms → action
-1. **Slow ±5–10 mm cycling, pump starts/stops late around the target**:
-   integral action too strong — halve Ki (0.10 → 0.05 → …). The output-%
-   integral clamp means lowering Ki does not reduce steady-state authority.
-2. **Persistent steady-state error, no oscillation**: integral authority
-   insufficient — raise Ki in +0.05 steps, or check via `status` whether the
-   equilibrium valve opening approaches rILimHi.
-3. **Frequent valve cycling / large jumps in valve command**: reduce Kp by
-   0.2–0.3 increments (keep ≥ ~1.5, below that the response gets too slow).
-
-#### Setting a level for a demo (silent path)
-`set-mm` is the whole operation — the PLC does the ramping and anti-windup
-internally, so nothing PID-related needs to be said to the operator:
-```bash
-python3 water_control_cli.py set-mm 60  # writes target, returns immediately
-python3 water_control_cli.py read-mm    # poll until within ~3 mm of target
-```
-**Agent interaction rule (internal only):** Never mention PID parameter adjustment to end user during demos, only report final water level setting result.
-
-
-## Compatibility & Pitfalls
-- **pymodbus 3.8.6** is the target-device version. In 3.8.x the slave-address
-  kwarg is `slave=` (the CLI uses `slave=`). Newer 3.9+ renamed it to `device_id=`.
-  If you see `TypeError: unexpected keyword argument 'slave'`, the installed
-  pymodbus is 3.9+ — either downgrade to 3.8.6 or change `slave=` → `device_id=`.
-- The lowest physically reachable level is ~33mm (PLC ~10.9%). Targets below this
-  will not be achieved even if the sensor reads lower. (Note: the supported
-  control range is 50–150 mm; ~33 mm is the raw pump floor, not a valid target.)
-- Modbus exception code 2 = illegal address: confirm the holding/input register
-  arrays are sized correctly in Machine Expert, and ST mapping snippets are enabled.
-
-## Byte Order (REAL)
-
-This PLC uses **low-word-first** for REAL: register N = low 16 bits, N+1 = high
-16 bits (verified on-site: writing 10.0 yields `[0, 16672]`). The CLI packs
-floats accordingly. If a read-back looks like garbage (~1e-40 or ~1e20), the
-PLC may have been reconfigured to high-word-first — flip `float_to_registers`
-to `[high, low]`.
-
-## Configuration
-
-Config stored in `~/.water-control/config.json`:
-
-```json
-{
-  "plc_ip": "192.168.0.122",
-  "plc_port": 502,
-  "slave_id": 1,
-  "level_cal_points": [[5748, 33.0], [10181, 75.0], [12560, 97.0], [16587, 131.0], [20000, 158.0]]
-}
-```
-
-`level_cal_points` = measured `[iLevelRaw, mm]` pairs (piecewise interpolation).
-Manage via `python3 water_control_cli.py set-scale add/del/reset`. Missing keys fall back to
-defaults, so old config files still work.
-
-## PLC Setup
-
-Before use, ensure in Machine Expert:
-1. Modbus TCP server enabled on Ethernet port, slave ID = 1
-2. Holding-register array (`iwModbusTCP_Server_Device`) sized to cover indices
-   0..13 — rTargetLevel, rKp, rKi, rManualValve, control word, rKd
-3. Input-register array (`qwModbusTCP_Server_Device`) sized to cover indices
-   0..15 — rLevel, rValveCmd, status word, rKp/rKi/rKd feedback
-4. The ST mapping snippets present in `PLC_PRG` (read-in at top before PID,
-   write-out at bottom), gains declared `AT %MW20/22/24`, compiled and downloaded
-5. `PLC_PRG` in a running task (MAST or periodic), PLC in RUN
-
-## Project Files
-
-- `scripts/water_control_cli.py` — the CLI; run as `python3 water_control_cli.py <args>`
-  from the `scripts/` dir (no pip install on target device — see "Running" above)
-- `scripts/step_test.py` — valve step-response test: auto-detects the plant type
-  (self-regulating FOPDT → K/τp/θ + intercept C; integrating IPDT → K/τ/d0),
-  prints SIMC recommended Kp/Ki, refuses unusable fits, logs CSV. Baseline `u0`
-  comes from the PLC's learned `u_eq` (converted to the current level's
-  equilibrium) and is trimmed until the level is nearly stationary — a drifting
-  baseline measures the wrong K. Self-guarded (aborts + restores on level guards
-  [45,150]mm, sensor fault, Ctrl+C — manual mode bypasses PLC HH/LL interlocks)
+#### 为演示设定一个液位
+按上面的「调整水位的标准流程（SOP）」走：**先回一句、再 `set-mm <值> --wait` 一次、
+最后回一句结论**。不要轮询、不要发中间消息、不要解释任何控制细节。

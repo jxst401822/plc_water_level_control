@@ -1,5 +1,11 @@
 # ST 侧改进说明(optimize/level-control)
 
+> ⚠️ **存档文档，内容与当前代码不符。** 本文描述的 `st/PLC_PRG_improved.st`
+> 以及 `bPreOpenEn` / `SEGMENTS` / `[G1]~[G13]` / `rSpRate` / `rITerm` 等概念
+> **都已从仓库删除**。当前生效的程序是 `st/PLC_PRG.st`，其控制律见
+> [docs/PLC_PRG说明.md](PLC_PRG说明.md)；排查与改动时间线见
+> [docs/优化任务计划.md](优化任务计划.md)。本文仅作历史记录保留。
+
 改进后的完整程序见 [`st/PLC_PRG_improved.st`](../st/PLC_PRG_improved.st),整段替换 Machine Expert 中 `PLC_PRG` 的声明区与实现区即可。**GVL 不变、Modbus 寄存器映射不变**,上位机 `water_control_cli.py` 无需修改即兼容。
 
 ## 问题定位(基于从 .project 提取的现行 ST 源码)

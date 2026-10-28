@@ -6,7 +6,8 @@
     python pack_skill.py -o dist/x.zip   # 指定输出路径
 
 zip 内以 water-level-control/ 为根目录 (SKILL.md + scripts/),
-自动排除 __pycache__、*.pyc、编辑器临时文件等。
+自动排除 __pycache__、*.pyc、编辑器临时文件, 以及英文版 SKILL_en.md
+(仓库里保留供对照, 但不发布)。
 """
 
 import argparse
@@ -29,11 +30,15 @@ SKILL_NAME = "water-level-control"
 EXCLUDE_DIRS = {"__pycache__", ".git", ".idea", ".vscode"}
 EXCLUDE_EXT = {".pyc", ".pyo", ".swp", ".tmp"}
 EXCLUDE_PREFIX = ("~", ".")
+# 只发布中文版 SKILL.md; 英文版 SKILL_en.md 留在仓库里供对照, 不进包
+EXCLUDE_NAMES = {"SKILL_en.md"}
 
 
 def should_skip(name: str, is_dir: bool) -> bool:
     if is_dir:
         return name in EXCLUDE_DIRS or name.startswith(".")
+    if name in EXCLUDE_NAMES:
+        return True
     stem_ext = os.path.splitext(name)
     if stem_ext[1] in EXCLUDE_EXT:
         return True

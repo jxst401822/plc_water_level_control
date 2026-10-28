@@ -23,17 +23,21 @@
 ## 目录结构
 
 ```
-├── docs/                        # 文档
+├── docs/                        # 文档(维护者视角)
 │   ├── product.md               # 产品设备信息(PLC/IO 模块/传感器/执行器)
 │   ├── 控制方案.md               # 控制原理、IO 映射、Machine Expert 配置、整定步骤
-│   └── ST侧改进说明.md           # ST 程序抗超调改进(斜坡/滤波/限速/去抖)与验证清单
+│   ├── PLC_PRG说明.md            # st/PLC_PRG.st 控制律逐段说明、Modbus 映射、整定对策、历史事故
+│   ├── 优化任务计划.md            # 排查与改动的时间线(含已作废的结论, 避免重犯)
+│   └── ST侧改进说明.md           # 早期改进记录(对应已删除的 PLC_PRG_improved.st, 仅存档)
 ├── st/                          # Machine Expert 工程文件(.project 及恢复文件)
-│   └── PLC_PRG_improved.st      # 改进版 PLC_PRG 完整源码(整段替换用)
+│   └── PLC_PRG.st               # 当前 PLC 程序完整源码(整段替换用, 任务周期 20ms)
 ├── skill/water-level-control/   # 上位机 CLI(Agent Skill 形式)
-│   ├── SKILL.md                 # Skill 说明:命令、Modbus 寄存器映射、整定经验
+│   ├── SKILL.md                 # Skill 说明(中文, 打包发布)—— **只写用法**, 不含实现细节
+│   ├── SKILL_en.md              # 同内容的英文版(仅供对照, **不打包**)
 │   └── scripts/
 │       ├── water_control_cli.py # 主 CLI:读写水位/PID/标定/手动模式
-│       └── step_test.py         # 阀阶跃试验:实测 K/τ/d0,输出 SIMC 推荐 PID 增益
+│       └── step_test.py         # 阀阶跃试验(定性参考: 单一 K 的 FOPDT 描述不了分段平衡曲线)
+├── pack_skill.py                # 打包脚本(自动排除 SKILL_en.md 与临时文件)
 └── output/                      # 运行输出目录(不入库)
 ```
 
@@ -46,7 +50,7 @@
 | 抽水泵启停 | TM3DQ16R Q0 | `%QX4.0` | BOOL(继电器) | 输出 |
 | 数字输入备用 | TM3DI16 | — | — | 输入 |
 
-HMI/Modbus 侧使用 `%MW` 区(目标水位 `%MW100-101`、实测水位 `%MW110-111` 等),与 Modbus TCP 服务器寄存器数组的映射在 ST 程序中显式完成,详见 [SKILL.md](skill/water-level-control/SKILL.md) 的 "Modbus Architecture" 一节。
+HMI/Modbus 侧使用 `%MW` 区(目标水位 `%MW100-101`、实测水位 `%MW110-111` 等),与 Modbus TCP 服务器寄存器数组的映射在 ST 程序中显式完成,详见 [docs/PLC_PRG说明.md](docs/PLC_PRG说明.md) 第 4 节（寄存器映射表）。
 
 ## PLC 侧(Machine Expert)
 

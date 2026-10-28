@@ -1,30 +1,19 @@
 """
-water-control-cli - Water Level Control CLI for Schneider PLC
+water_control_cli.py - 施耐德 PLC 水位控制命令行工具
 
-A command-line tool to control water level via Modbus TCP.
-Communicates with Schneider TM310MM35ECT16U PLC.
+通过 Modbus TCP 读写水位目标、实测液位、PID 增益、手动阀/泵, 并做液位标定。
+PLC 内部一律用百分比 (0-100% = 4-20mA), mm 换算在客户端完成。
 
-Usage:
-    water-control read                  Read current target level (percent)
-    water-control read-mm               Read current ACTUAL level (mm)
-    water-control write <value>         Set target level (0-100 percent)
-    water-control set-mm <mm>           Set target level in mm (absolute)
-    water-control raise <mm>            Raise target by mm (e.g. raise 20 for +20mm)
-    water-control lower <mm>            Lower target by mm (e.g. lower 15 for -15mm)
-    water-control status                Show all PLC status (with mm)
-    water-control set-pid <kp> <ki> <kd>  Set PID gains (enables Modbus tuning)
-    water-control get-pid               Read PID gains the PLC is using
-    water-control set-ip <ip>           Set PLC IP address
-    water-control set-scale             Show calibration points (run with no subcmd)
-    water-control set-scale add <raw> <mm>  Add a calibration point (iLevelRaw, mm)
-    water-control set-scale del <raw>   Delete a calibration point
-    water-control set-scale reset       Reset to default calibration points
+**完整用法、SOP、安全须知见同目录上级的 SKILL.md**(中文版, 随 skill 打包)。
+快速上手:
+    python3 water_control_cli.py status                 # 看当前状态
+    python3 water_control_cli.py set-mm 100 --wait      # 调到 100mm 并阻塞到稳定
+    python3 water_control_cli.py stop --delay 5         # 静止化(留 5s 给操作员关上方阀门)
+    python3 water_control_cli.py resume                 # 恢复自动运行
+    python3 water_control_cli.py calibrate --show       # 看当前 mm 标定
 
-Calibration (piecewise linear, multi-point) is in ~/.water-control/config.json as
-"level_cal_points": list of [iLevelRaw, mm] measured pairs. PLC stays in percent;
-CLI converts mm<->% via interpolation so the PLC program never changes.
-Device limit: pump can only draw water down to ~43mm (PLC ~10.9%); below that
-the pump cannot evacuate further even though the sensor reads lower.
+配置文件: ~/.water-control/config.json (plc_ip / plc_port / slave_id / level_model)
+设备限制: 支持的目标水位 50-150mm; 泵物理下限约 45.3mm。
 """
 
 import argparse
@@ -38,6 +27,15 @@ from datetime import datetime
 from pathlib import Path
 
 from pymodbus.client import ModbusTcpClient
+
+# Windows GBK 控制台兼容: 输出里的 OK/WARN 标记与 emoji 无法编码时替换而不是抛
+# UnicodeEncodeError 把整条命令崩掉。Linux/UTF-8 下无影响。
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(errors="replace")
+        except Exception:
+            pass
 
 # Config file path
 CONFIG_DIR = Path.home() / ".water-control"
@@ -345,6 +343,119 @@ def cmd_read_mm(args, config):
         client.close()
 
 
+SUPPORTED_MM = (50.0, 150.0)   # 支持设定目标的区间(平衡曲线实测覆盖范围)
+
+
+def _wait_settled(client, config, target_mm, tolerance=3.0, timeout=100.0,
+                  interval=2.0, need=3, stall_grace=15.0):
+    """写目标之后就地轮询, 直到液位进入 target±tolerance 并连续 need 次保持。
+
+    存在的意义: 让 agent **一次工具调用**就完成"设定 + 等待 + 结论", 不需要自己写
+    轮询循环。agent 每多一次工具调用就多一次向用户自言自语的机会
+    ("还在等""再查一次"), 这是本函数要避免的主要故障模式。
+
+    三种结束方式:
+      settled  —— 连续 need 次落在容差内                     (reason='settled')
+      stalled  —— 液位已停住 stall_grace 秒但仍差 tolerance 以上 (reason='stalled')
+                  提前退出, 不白等到 timeout。到不了位通常就是这个形态。
+      timeout  —— 到 timeout 仍在动且没进容差                  (reason='timeout')
+
+    复用同一个 Modbus 连接。返回 (ok, reason, elapsed_s, level_mm, valve_pct,
+    drift_mm_per_s)。不抛异常 —— 调用方决定怎么报告。
+    """
+    sid = config["slave_id"]
+    t0 = time.time()
+    hist = []            # (t, mm) 用于算漂移
+    streak = 0
+    still_since = None
+    next_report = 10.0
+    while True:
+        el = time.time() - t0
+        lvl_pct = read_input_real(client, IREG_LEVEL, sid)
+        lvl_mm = pct_to_mm(lvl_pct, config)
+        try:
+            valve = read_input_real(client, IREG_VALVE_CMD, sid)
+        except Exception:
+            valve = float("nan")
+        hist.append((el, lvl_mm))
+        if len(hist) > 30:
+            hist.pop(0)
+
+        dev = abs(lvl_mm - target_mm)
+        if dev <= tolerance:
+            streak += 1
+            if streak >= need:
+                return True, "settled", el, lvl_mm, valve, _drift(hist[-6:])
+        else:
+            streak = 0
+
+        # 停住判定: 用最近 6 点(约 12s)的斜率, 静差大于容差且已不动 -> 提前退出
+        d6 = _drift(hist[-6:]) if len(hist) >= 6 else None
+        if d6 is not None and abs(d6) < 0.02:
+            if still_since is None:
+                still_since = el
+            elif dev > tolerance and (el - still_since) >= stall_grace:
+                return False, "stalled", el, lvl_mm, valve, d6
+        else:
+            still_since = None
+
+        if el >= timeout:
+            return False, "timeout", el, lvl_mm, valve, _drift(hist[-6:])
+        if el >= next_report:
+            print(f"  t={el:5.0f}s  level={lvl_mm:6.1f}mm  (距目标 "
+                  f"{lvl_mm - target_mm:+5.1f}mm)  valve={valve:5.1f}%")
+            next_report += 10.0
+        time.sleep(max(0.1, interval))
+
+
+def _drift(hist):
+    """最近若干点的最小二乘斜率, mm/s。点太少返回 0。"""
+    if len(hist) < 3:
+        return 0.0
+    n = len(hist)
+    sx = sum(t for t, _ in hist)
+    sy = sum(y for _, y in hist)
+    sxx = sum(t * t for t, _ in hist)
+    sxy = sum(t * y for t, y in hist)
+    den = n * sxx - sx * sx
+    return (n * sxy - sx * sy) / den if den else 0.0
+
+
+def _report_wait(ok, reason, el, lvl_mm, target_mm, valve, drift,
+                 tolerance, timeout):
+    """打印 --wait 的结论行, 返回进程退出码 (0=已稳定, 3=未到位)。"""
+    dev = lvl_mm - target_mm
+    if ok:
+        print(f"OK 已稳定: {lvl_mm:.1f} mm  (目标 {target_mm:g}, 偏差 {dev:+.1f}mm)  "
+              f"用时 {el:.0f}s  阀 {valve:.1f}%")
+        return 0
+    head = ("WARN 到不了位" if reason == "stalled" else "WARN 超时未稳定")
+    why = (f"液位已停住不再变化 (等了 {el:.0f}s)" if reason == "stalled"
+           else f"超时 {timeout:g}s, 漂移 {drift:+.3f} mm/s")
+    print(f"{head}: 当前 {lvl_mm:.1f} mm, 距目标 {dev:+.1f}mm "
+          f"(容差 ±{tolerance:g}mm), 阀 {valve:.1f}%  [{why}]", file=sys.stderr)
+    if reason == "stalled":
+        print("  这是稳态静差, 不是还没走到: 该目标处的前馈偏差超出了积分的修正权限。"
+              " 把(目标, 实测液位, 阀开度)记录下来上报, **不要重试、不要继续轮询、"
+              "不要自行改 PID**。", file=sys.stderr)
+    elif abs(dev) <= tolerance:
+        print("  最后一次读数其实已在容差内, 但没能连续多次保持 —— 说明液位"
+              " 正在目标附近来回穿越(振荡), 不是没走到。记下波动带宽上报,"
+              " 不要重试。", file=sys.stderr)
+    else:
+        print("  上升本来就慢(靠重力自流)。可以再用 --wait 等一次; 若两次都超时"
+              " 就按上面那条上报。", file=sys.stderr)
+    return 3
+
+
+def _check_supported(mm):
+    lo, hi = SUPPORTED_MM
+    if not lo <= mm <= hi:
+        print(f"WARN 目标 {mm:g}mm 超出支持区间 {lo:g}-{hi:g}mm "
+              f"(平衡曲线只在这段有实测点)。仍可执行, 但可能到不了位。",
+              file=sys.stderr)
+
+
 def cmd_set_mm(args, config):
     """Set target level in mm (converts to % via affine cal and writes rTargetLevel)."""
     mm = args.value
@@ -357,6 +468,17 @@ def cmd_set_mm(args, config):
     try:
         write_real(client, REG_TARGET_LEVEL, pct, config["slave_id"])
         print(f"OK: rTargetLevel = {mm:g} mm ({pct:.1f}%)")
+        if not args.wait:
+            _check_supported(mm)
+            return
+        _check_supported(mm)
+        print(f"等待稳定 (容差 ±{args.tolerance:g}mm, 连续 {args.confirm} 次, "
+              f"超时 {args.timeout:g}s, 每 {args.interval:g}s 轮询)...")
+        ok, reason, el, lvl, valve, drift = _wait_settled(
+            client, config, mm, args.tolerance, args.timeout,
+            args.interval, args.confirm)
+        sys.exit(_report_wait(ok, reason, el, lvl, mm, valve, drift,
+                              args.tolerance, args.timeout))
     finally:
         client.close()
 
@@ -378,6 +500,15 @@ def cmd_raise_lower(args, config):
         new_pct = mm_to_pct(new_mm, config)
         write_real(client, REG_TARGET_LEVEL, new_pct, config["slave_id"])
         print(f"OK: target {old_mm:.1f} -> {new_mm:.1f} mm  ({old_pct:.1f}% -> {new_pct:.1f}%)")
+        _check_supported(new_mm)
+        if args.wait:
+            print(f"等待稳定 (容差 ±{args.tolerance:g}mm, 连续 {args.confirm} 次, "
+                  f"超时 {args.timeout:g}s, 每 {args.interval:g}s 轮询)...")
+            ok, reason, el, lvl, valve, drift = _wait_settled(
+                client, config, new_mm, args.tolerance, args.timeout,
+                args.interval, args.confirm)
+            sys.exit(_report_wait(ok, reason, el, lvl, new_mm, valve, drift,
+                                  args.tolerance, args.timeout))
     finally:
         client.close()
 
@@ -469,12 +600,15 @@ def cmd_valve(args, config):
         client.close()
 
 
-def _quiescent_report(client, config, settle=5.0, samples=5):
+def _quiescent_report(client, config, settle=5.0, samples=5, last=True):
     """静水确认: 回读阀/泵状态, 再看液位是否真的不动了。
 
     返回 (ok, drift_mm)。ok=False 有两种原因, 分开报:
       - PLC 侧没执行(阀仍开/泵仍转) —— 多半是 HH 联锁在强制抽水
       - PLC 侧已全关但液位仍在变 —— 上方左右桶连通没阻断, 或在漏水
+
+    last=False 表示后面还会重试(操作员可能正在关上方阀门), 此时把"没阻断"
+    的告警降级成提示, 避免第一次尝试就吓一跳。
     """
     sid = config["slave_id"]
     sw = read_status_word(client, sid)
@@ -486,8 +620,8 @@ def _quiescent_report(client, config, settle=5.0, samples=5):
         if sw & ST_SENSOR_FAULT:
             print("⚠️ 传感器故障联锁生效中(阀应为 0), 先查探头接线", file=sys.stderr)
         elif sw & ST_ALARM:
-            print("⚠️ PLC 安全联锁在覆盖手动指令 —— 液位高于 rLvlHH(95%) 时会强制"
-                  "阀 100% + 泵 ON。这是设计行为, 手动/stop 都盖不住它。"
+            print("⚠️ PLC 安全联锁在覆盖手动指令 —— 液位高于 rLvlHH(当前 98.5%) 时"
+                  "会强制阀 100% + 泵 ON。这是设计行为, 手动/stop 都盖不住它。"
                   "要真正静止, 先把液位降到 HH 以下(或临时抬高 rLvlHH)。",
                   file=sys.stderr)
         else:
@@ -510,8 +644,12 @@ def _quiescent_report(client, config, settle=5.0, samples=5):
     print(f"漂移检查({settle:g}s, {samples} 次): raw {raws[0]} -> {raws[-1]}   "
           f"净漂移 {drift:+.2f}mm   峰峰 {span:.2f}mm")
     if abs(drift) > 1.0 or span > 3.0:
-        print("⚠️ 液位仍在移动 —— 泵和阀都已关闭, 说明**上方左右桶连通没阻断**"
-              "(或桶体/管路在漏水)。此时做校准或阶跃测量都会失真。", file=sys.stderr)
+        if last:
+            print("⚠️ 液位仍在移动 —— 泵和阀都已关闭, 说明**上方左右桶连通没阻断**"
+                  "(或桶体/管路在漏水)。此时做校准或阶跃测量都会失真。",
+                  file=sys.stderr)
+        else:
+            print("  液位仍在移动 —— 如果操作员刚刚才关掉上方阀门, 属正常, 会再查一次")
         return False, drift
     print("✅ 系统已静止: 上下都封闭, 液位不动。可以校准/采样。")
     return True, drift
@@ -534,6 +672,20 @@ def cmd_stop(args, config):
               f"阀 {before_valve:.1f}%")
         print(f"  记下这个平衡开度: u_eq(当前目标) = {ueq:.1f}%  ← resume 会用它预置积分")
 
+        # ---- 倒计时: 给操作员留出去关上方进水开关的时间 ----
+        # 必须在写入之前倒数, 因为一旦切手动+阀0, 液位就只受上方自流支配了。
+        d = max(0.0, args.delay)
+        if d > 0:
+            print(f"⏳ {d:.0f} 秒后关闭水泵与阀门。"
+                  f"**请现在关闭设备上方左右桶连通的开关。**", flush=True)
+            n = int(round(d))
+            for k in range(n, 0, -1):
+                print(f"   {k} ...", flush=True)
+                time.sleep(1.0)
+            frac = d - n
+            if frac > 0.05:
+                time.sleep(frac)
+
         write_real(client, REG_MANUAL_VALVE, 0.0, sid)      # 1. 手动阀归零
         set_control_bit(client, CTL_MANUAL_PUMP, False, sid)  # 2. 手动泵 OFF
         word = set_control_bit(client, CTL_AUTO, False, sid)  # 3. 最后切手动
@@ -541,12 +693,24 @@ def cmd_stop(args, config):
               f"(control word=0x{word:04X})")
         print("  现场动作: 阻断设备上方左右桶的连通(关阀/夹管/抬管)")
 
-        time.sleep(0.4)                                     # 等 >=1 个 PLC 周期(100ms)
-        ok, _ = _quiescent_report(client, config,
-                                  settle=args.settle, samples=args.samples)
+        time.sleep(0.4)                                     # 等 >=1 个 PLC 周期
+
+        # ---- 漂移检查, 允许重试 ----
+        # 操作员可能是在倒计时里才动手, 关阀动作会落在第一次检查窗口内, 所以
+        # 第一次失败不一定是漏水/没关, 再查 recheck 次才下结论。
+        tries = max(1, args.recheck + 1)
+        ok = False
+        for i in range(tries):
+            ok, _ = _quiescent_report(client, config, settle=args.settle,
+                                      samples=args.samples, last=(i == tries - 1))
+            if ok or args.force:
+                break
+            if i < tries - 1:
+                print(f"  {args.retry_wait:g}s 后复查 ({i + 2}/{tries}) ...", flush=True)
+                time.sleep(max(0.5, args.retry_wait))
         if not ok and not args.force:
             sys.exit(2)
-        print("下一步: 校准 → calibrate --sample --label low|high ;  "
+        print("下一步: 校准 → calibrate --sample --label low|mid|high ;  "
               "恢复运行 → resume")
     finally:
         client.close()
@@ -1153,6 +1317,30 @@ def cmd_set_scale(args, config):
         print(f"Error: unknown subcommand '{sub}'"); sys.exit(1)
 
 
+def _add_wait_opts(p):
+    """给"设定目标"类子命令加上 --wait 及其参数。
+
+    默认 timeout=100s 是刻意的: 要留在 Bash 工具默认 120s 超时之内, 这样 agent
+    一次调用就能拿到结论, 不必自己写轮询循环(那会导致它每轮都向用户发一句
+    "还在等待")。需要更久就显式传 --timeout, 并同步放大 Bash 工具的超时。
+    """
+    p.add_argument("--wait", action="store_true",
+                   help="block until the level settles within --tolerance of the "
+                        "target (exit 0) or --timeout elapses (exit 3); polls "
+                        "internally so the caller needs only ONE invocation")
+    p.add_argument("--tolerance", type=float, default=3.0,
+                   help="settled band around the target in mm (default 3.0; the "
+                        "PLC has a +-1.4mm steady-state deadband by design)")
+    p.add_argument("--timeout", type=float, default=100.0,
+                   help="max seconds to wait (default 100, keep it under the "
+                        "caller's own tool timeout)")
+    p.add_argument("--interval", type=float, default=2.0,
+                   help="poll interval in seconds (default 2)")
+    p.add_argument("--confirm", type=int, default=3,
+                   help="consecutive in-band reads required to call it settled "
+                        "(default 3 = 6s, guards against a ripple crossing)")
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="water-control",
@@ -1173,12 +1361,15 @@ def main():
     # set-mm command (absolute mm)
     setmm_parser = subparsers.add_parser("set-mm", help="Set target level in mm (absolute)")
     setmm_parser.add_argument("value", type=float, help="Target level in mm (0..full-scale)")
+    _add_wait_opts(setmm_parser)
 
     # raise / lower commands (delta mm)
     raise_parser = subparsers.add_parser("raise", help="Raise target by delta mm")
     raise_parser.add_argument("value", type=float, help="Delta in mm (e.g. 20 for +20mm)")
+    _add_wait_opts(raise_parser)
     lower_parser = subparsers.add_parser("lower", help="Lower target by delta mm")
     lower_parser.add_argument("value", type=float, help="Delta in mm (e.g. 15 for -15mm)")
+    _add_wait_opts(lower_parser)
 
     # status command
     subparsers.add_parser("status", help="Show all PLC status (with mm)")
@@ -1238,10 +1429,21 @@ def main():
         "stop",
         help="Quiesce the rig: pump OFF + valve 0%% + manual (block the upper "
              "link by hand), then verify the level really stops moving")
-    stop_p.add_argument("--settle", type=float, default=5.0,
-                        help="seconds of drift checking after stopping (default 5, 0=skip)")
+    stop_p.add_argument("--delay", type=float, default=5.0,
+                        help="seconds of countdown before closing the pump/valve, "
+                             "so the operator can shut the upper link between the "
+                             "two tanks (default 5, 0 = act immediately). The agent "
+                             "must announce this BEFORE calling stop")
+    stop_p.add_argument("--settle", type=float, default=8.0,
+                        help="seconds of drift checking after stopping (default 8, 0=skip)")
     stop_p.add_argument("--samples", type=int, default=5,
-                        help="level samples taken during the drift check (default 5)")
+                        help="level samples taken during each drift check (default 5)")
+    stop_p.add_argument("--recheck", type=int, default=2,
+                        help="extra drift checks if the first one fails (default 2) — "
+                             "the operator may still be closing the upper valve "
+                             "during the first window")
+    stop_p.add_argument("--retry-wait", type=float, default=10.0,
+                        help="seconds to wait between drift rechecks (default 10)")
     stop_p.add_argument("--force", action="store_true",
                         help="exit 0 even if the rig is not quiescent")
     resume_p = subparsers.add_parser(
